@@ -1,0 +1,102 @@
+from typing import Optional
+import logging
+import time
+import json
+from datetime import datetime
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+
+from ..main import get_api_key
+
+
+router = APIRouter(dependencies=[Depends(get_api_key)])
+
+
+class ForecastRequest(BaseModel):
+    lat: float
+    lon: float
+    date: str  # YYYY-MM-DD
+
+
+class ForecastResponse(BaseModel):
+    temp_c: float
+    precip_prob: float
+    wind_kph: float
+    summary: str
+
+
+@router.post("/forecast", response_model=ForecastResponse)
+async def forecast(req: ForecastRequest) -> ForecastResponse:
+    start_time = time.monotonic()
+    params = {
+        "latitude": req.lat,
+        "longitude": req.lon,
+        "hourly": "temperature_2m,precipitation_probability,windspeed_10m",
+        "start_date": req.date,
+        "end_date": req.date,
+        "timezone": "UTC",
+    }
+    headers = {"User-Agent": "CityDayNavigator-MCP-Tool"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://api.open-meteo.com/v1/forecast", params=params, headers=headers
+            )
+            if resp.status_code != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Open-Meteo error: {resp.status_code}",
+                )
+            data = resp.json()
+            latency_ms = (time.monotonic() - start_time) * 1000
+            http_status = resp.status_code
+            ok = True
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Open-Meteo request failed: {str(e)}",
+        )
+
+    hourly = data.get("hourly") or {}
+    times = hourly.get("time") or []
+    temps = hourly.get("temperature_2m") or []
+    precips = hourly.get("precipitation_probability") or []
+    winds = hourly.get("windspeed_10m") or []
+
+    # Find the noon (12:00) entry in UTC
+    target_prefix = f"{req.date}T12:00"
+    try:
+        idx = next(i for i, t in enumerate(times) if t.startswith(target_prefix))
+    except StopIteration:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Open-Meteo response missing 12:00 data",
+        )
+
+    try:
+        temp_c = float(temps[idx])
+        precip_prob = float(precips[idx]) if idx < len(precips) else 0.0
+        wind_kph = float(winds[idx]) if idx < len(winds) else 0.0
+    except (ValueError, IndexError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Open-Meteo response malformed",
+        )
+
+    summary = f"{temp_c:.0f}°C with {precip_prob:.0f}% chance of rain"
+    log_data = {
+        "ts": datetime.utcnow().isoformat(),
+        "tool": "mcp-weather",
+        "fn": "forecast",
+        "latency_ms": f"{latency_ms:.2f}",
+        "ok": ok,
+        "http_status": http_status,
+    }
+    logging.info(json.dumps(log_data))
+    return ForecastResponse(
+        temp_c=temp_c, precip_prob=precip_prob, wind_kph=wind_kph, summary=summary
+    )
+

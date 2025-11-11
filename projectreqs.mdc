@@ -1,0 +1,101 @@
+---
+alwaysApply: true
+---
+## Assignment — City Day Navigator
+
+### Goal
+Given a city and time window, build a copilot that plans a day: checks weather and air quality, finds nearby points of interest and events, estimates travel time, converts currency, and streams a concise plan with alternatives. Must use Gemini for reasoning and summaries, and MCP to call APIs.
+
+### Required external APIs (no-key or free tiers)
+- Open-Meteo (weather forecast): `https://api.open-meteo.com/v1/forecast`
+- OpenAQ (air quality): `https://api.openaq.org/v2/measurements`
+- Nominatim / OpenStreetMap (geocoding + places): `https://nominatim.openstreetmap.org/search` and `https://nominatim.openstreetmap.org/reverse`
+- OSRM demo (routing and ETAs): `https://router.project-osrm.org/route/v1/{profile}/{lon},{lat};{lon},{lat}`
+- Nager.Date (public holidays): `https://date.nager.at/api/v3/PublicHolidays/{year}/{countryCode}`
+- exchangerate.host (FX rates): `https://api.exchangerate.host/latest`
+- Optional: add one more API (e.g., Wikidata SPARQL for notable venues)
+
+### What to build
+
+#### 1) MCP tools (one server with multiple tools is fine)
+- Constraints (apply to all tools):
+  - Enforce `X-API-KEY`
+  - JSON-Schema I/O
+  - Rate limit: 30 req/min per tool
+- Tools and functions:
+  - mcp-geo
+    - geocode(city: string, country_hint?: string) -> { lat, lon, display_name }
+    - nearby(lat: number, lon: number, query: string, radius_m: int<=5000, limit: int<=15) -> [{ name, lat, lon, tags }]
+  - mcp-weather
+    - forecast(lat: number, lon: number, date: string) -> { temp_c, precip_prob, wind_kph, summary }
+  - mcp-air
+    - aqi(lat: number, lon: number, date?: string) -> { pm25, pm10, no2, o3, category }
+  - mcp-route
+    - eta(points: [{ lat, lon }], profile: "foot" | "bike" | "car") -> { distance_km, duration_min, polyline }
+  - mcp-calendar
+    - holidays(country_code: string, year: int) -> [{ date, localName }]
+  - mcp-fx
+    - convert(amount: number, from: string, to: string) -> { rate, converted }
+- Logging (JSON lines): { ts, tool, fn, latency_ms, ok, http_status }
+
+#### 2) Orchestrator
+Use Gemini to:
+- Classify user intent: { plan_day | refine_plan | compare_options }
+- Generate a draft itinerary: pick 4–6 venues from `mcp-geo.nearby`, filtered by weather/air constraints
+- Insert travel legs using `mcp-route.eta`
+- Adjust schedule for public holidays
+- Price hint: use `mcp-fx.convert` for simple budget lines (e.g., ₹→$)
+- Summarize with reasoning notes and 2 alternatives if rain probability > 60%
+- Streaming required. Show tool-call trace
+
+#### 3) Client
+CLI application
+- Input: city, date, preferences (e.g., “walkable”, “museums”, “coffee”)
+- Output: live token stream + collapsible “Tool Trace”
+- Export: Markdown itinerary download
+
+### Acceptance tests (must pass)
+- Basic plan: “Plan 10:00–18:00 in Kyoto on 2025-12-12. Prefer temples and walkable.”
+  - Output lists 4–6 stops with time windows
+  - Includes at least one OSRM ETA
+  - Includes a weather note
+- Rain fallback: For a date with ≥60% precip, produce an indoor-heavy alternative section
+- Air quality guardrail: If PM2.5 > 75 μg/m³, mark outdoor segments as “mask recommended” or suggest indoor swap
+- Holiday awareness: If a public holiday matches the date, add a caution line about closures or crowds
+- FX check: “Convert 200 USD to JPY” returns a rate and converted value from exchangerate.host
+- Trace visibility: Response shows which tools were called, with durations
+- Determinism: Same prompt twice → same stop order and ETAs within ±5%
+
+### Deliverables
+- Public repo with README.md:
+  - Setup, run, and example prompts
+  - Architecture diagram (Mermaid)
+  - API endpoints used and request examples
+  - Notes on Gemini prompts for routing and summarization
+- Minimal tests: one per acceptance point
+- Optional Docker Compose: one-command start
+
+### Example prompt set
+- “Plan a museum-first day in Amsterdam on 2025-11-22. Bike preferred.”
+- “Refine: add a specialty coffee stop near the second venue.”
+- “Compare two options if it rains after 3pm.”
+
+### Compliance checklist
+- Frontmatter present and up-to-date (consider `specVersion` on normative changes)
+- All required APIs referenced and documented (Open-Meteo, OpenAQ, Nominatim, OSRM, Nager.Date, exchangerate.host)
+- MCP server enforces `X-API-KEY`, JSON-Schema I/O, and 30 req/min/tool rate limit
+- MCP tools expose specified function signatures and return fields
+- JSON-lines logging includes: ts, tool, fn, latency_ms, ok, http_status
+- Orchestrator uses Gemini for intent, itinerary generation, routing, holiday adjustment, FX hints, and rainy-day alternatives (>60% precip)
+- Streaming enabled and response includes visible tool-call trace
+- CLI accepts inputs (city, date, preferences) and exports Markdown itinerary
+- Acceptance tests implemented for all listed cases and pass in CI (including determinism ±5%)
+- Tooling enforcement: CI uses `uv` (not `pip`) and executes inside a `venv`
+- README contains setup, prompts, Mermaid architecture, API examples, and prompt notes
+
+### Testing policy
+- TESTING WILL BE DONE EVERYTIME A NEW FEATURE IS ADDED.
+
+### Tooling policy
+- Use `uv` as the Python package manager. Do not use `pip`.
+- Always run within a Python virtual environment (`venv`) for development, testing, and execution.
