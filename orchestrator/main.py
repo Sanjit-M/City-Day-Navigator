@@ -13,7 +13,7 @@ import uvicorn
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-MCP_TOOLS_URL = "http://mcp-tools:3001"
+MCP_TOOLS_URL = "http://localhost:3001"
 MCP_API_KEY = os.getenv("MCP_API_KEY")
 model = genai.GenerativeModel("gemini-2.5-flash-preview-09-2025")
 
