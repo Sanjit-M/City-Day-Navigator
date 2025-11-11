@@ -8,7 +8,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from ..main import get_api_key
+from ..deps import get_api_key
+from ..config import CONFIG
 
 
 router = APIRouter(dependencies=[Depends(get_api_key)])
@@ -40,15 +41,15 @@ async def eta(req: ETARequest) -> ETAResponse:
         )
 
     coords = ";".join(f"{p.lon},{p.lat}" for p in req.points)
-    url = f"https://router.project-osrm.org/route/v1/{req.profile}/{coords}"
+    url = f"{CONFIG.osrm_base}/route/v1/{req.profile}/{coords}"
     params = {
         "overview": "simplified",
         "geometries": "polyline",
     }
-    headers = {"User-Agent": "CityDayNavigator-MCP-Tool"}
+    headers = {"User-Agent": CONFIG.user_agent}
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
             resp = await client.get(url, params=params, headers=headers)
             if resp.status_code != 200:
                 raise HTTPException(

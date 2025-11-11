@@ -9,7 +9,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from ..main import get_api_key
+from ..deps import get_api_key
+from ..config import CONFIG
 
 
 OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY")
@@ -55,13 +56,13 @@ async def aqi(req: AQIRequest) -> AQIResponse:
 
     headers = {
         "X-API-Key": OPENAQ_API_KEY,
-        "User-Agent": "CityDayNavigator-MCP-Tool",
+        "User-Agent": CONFIG.user_agent,
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
             resp = await client.get(
-                "https://api.openaq.org/v2/measurements",
+                f"{CONFIG.openaq_base}/measurements",
                 params=params,
                 headers=headers,
             )

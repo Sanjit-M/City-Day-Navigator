@@ -8,7 +8,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from ..main import get_api_key
+from ..deps import get_api_key
+from ..config import CONFIG
 
 
 router = APIRouter(dependencies=[Depends(get_api_key)])
@@ -38,12 +39,12 @@ async def forecast(req: ForecastRequest) -> ForecastResponse:
         "end_date": req.date,
         "timezone": "UTC",
     }
-    headers = {"User-Agent": "CityDayNavigator-MCP-Tool"}
+    headers = {"User-Agent": CONFIG.user_agent}
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
             resp = await client.get(
-                "https://api.open-meteo.com/v1/forecast", params=params, headers=headers
+                CONFIG.open_meteo_base, params=params, headers=headers
             )
             if resp.status_code != 200:
                 raise HTTPException(

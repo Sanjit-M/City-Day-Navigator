@@ -4,6 +4,7 @@ from typing import Optional
 from pathlib import Path
 import sys
 import json
+import os
 
 import typer
 import rich
@@ -23,7 +24,8 @@ def cli(
     ),
 ) -> None:
     markdown_output = ""
-    url = "http://localhost:3002/plan-day"
+    orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:3002")
+    url = f"{orchestrator_url.rstrip('/')}/plan-day"
 
     with console.status("Planning your day..."):
         try:

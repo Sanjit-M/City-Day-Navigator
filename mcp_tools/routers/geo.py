@@ -8,7 +8,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from ..main import get_api_key
+from ..deps import get_api_key
+from ..config import CONFIG
 
 
 router = APIRouter(dependencies=[Depends(get_api_key)])
@@ -35,11 +36,11 @@ async def geocode(req: GeocodeRequest) -> GeocodeResponse:
         "limit": 1,
         "addressdetails": 0,
     }
-    headers = {"User-Agent": "CityDayNavigator-MCP-Tool"}
+    headers = {"User-Agent": CONFIG.user_agent}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
             resp = await client.get(
-                "https://nominatim.openstreetmap.org/search",
+                f"{CONFIG.nominatim_base}/search",
                 params=params,
                 headers=headers,
             )
@@ -125,11 +126,11 @@ async def nearby(req: NearbyRequest) -> NearbyResponse:
         "bounded": 1,
         "extratags": 1,
     }
-    headers = {"User-Agent": "CityDayNavigator-MCP-Tool"}
+    headers = {"User-Agent": CONFIG.user_agent}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
             resp = await client.get(
-                "https://nominatim.openstreetmap.org/search",
+                f"{CONFIG.nominatim_base}/search",
                 params=params,
                 headers=headers,
             )

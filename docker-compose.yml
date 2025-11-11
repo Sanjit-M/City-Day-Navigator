@@ -2,16 +2,35 @@ version: "3.9"
 services:
   mcp_tools:
     build: ./mcp_tools
-    command: uvicorn app:app --host 0.0.0.0 --port 8001
+    command: uvicorn mcp_tools.main:app --host 0.0.0.0 --port 3001
     ports:
-      - "8001:8001"
+      - "3001:3001"
+    env_file:
+      - .env
     environment:
-      - X_API_KEY=${X_API_KEY:-dev-key}
+      - PORT=3001
+      - MCP_API_KEY=${MCP_API_KEY:-dev-key}
+      - MCP_RATE_LIMIT=${MCP_RATE_LIMIT:-30/minute}
+      - MCP_USER_AGENT=${MCP_USER_AGENT:-CityDayNavigator-MCP-Tool}
+      - HTTP_TIMEOUT_SEC=${HTTP_TIMEOUT_SEC:-10}
   orchestrator:
     build: ./orchestrator
-    command: uvicorn app:app --host 0.0.0.0 --port 8000
+    command: uvicorn orchestrator.main:app --host 0.0.0.0 --port 3002
     ports:
-      - "8000:8000"
+      - "3002:3002"
+    env_file:
+      - .env
     depends_on:
       - mcp_tools
+    environment:
+      - PORT=3002
+      - MCP_API_KEY=${MCP_API_KEY:-dev-key}
+      - MCP_TOOLS_URL=http://mcp_tools:3001
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash-preview-09-2025}
+      - CLASSIFICATION_DEFAULT_DATE=${CLASSIFICATION_DEFAULT_DATE:-2025-11-10}
+      - HTTP_TIMEOUT_SEC=${HTTP_TIMEOUT_SEC:-15}
+      - NEARBY_RADIUS_M=${NEARBY_RADIUS_M:-3000}
+      - NEARBY_LIMIT=${NEARBY_LIMIT:-1}
+      - ROUTE_PROFILE_DEFAULT=${ROUTE_PROFILE_DEFAULT:-foot}
 

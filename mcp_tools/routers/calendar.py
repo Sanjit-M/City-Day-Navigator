@@ -8,7 +8,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from ..main import get_api_key
+from ..deps import get_api_key
+from ..config import CONFIG
 
 
 router = APIRouter(dependencies=[Depends(get_api_key)])
@@ -31,11 +32,11 @@ class HolidaysResponse(BaseModel):
 @router.post("/holidays", response_model=HolidaysResponse)
 async def holidays(req: HolidaysRequest) -> HolidaysResponse:
     start_time = time.monotonic()
-    url = f"https://date.nager.at/api/v3/PublicHolidays/{req.year}/{req.country_code}"
-    headers = {"User-Agent": "CityDayNavigator-MCP-Tool"}
+    url = f"{CONFIG.nager_base}/PublicHolidays/{req.year}/{req.country_code}"
+    headers = {"User-Agent": CONFIG.user_agent}
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code != 200:
                 raise HTTPException(

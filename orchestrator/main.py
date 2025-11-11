@@ -13,9 +13,18 @@ import uvicorn
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-MCP_TOOLS_URL = "http://localhost:3001"
+MCP_TOOLS_URL = os.getenv("MCP_TOOLS_URL", "http://mcp-tools:3001")
 MCP_API_KEY = os.getenv("MCP_API_KEY")
-model = genai.GenerativeModel("gemini-2.5-flash-preview-09-2025")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-09-2025")
+CLASSIFICATION_DEFAULT_DATE = os.getenv("CLASSIFICATION_DEFAULT_DATE", "2025-11-10")
+ROUTE_PROFILE_DEFAULT = os.getenv("ROUTE_PROFILE_DEFAULT", "foot")
+NEARBY_RADIUS_M = int(os.getenv("NEARBY_RADIUS_M", "3000"))
+NEARBY_LIMIT = int(os.getenv("NEARBY_LIMIT", "1"))
+try:
+    HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "15"))
+except ValueError:
+    HTTP_TIMEOUT_SEC = 15.0
+model = genai.GenerativeModel(GEMINI_MODEL)
 
 
 class PlanRequest(BaseModel):
@@ -27,7 +36,7 @@ app = FastAPI(title="City Day Navigator - Orchestrator")
 
 async def stream_plan(prompt: str):
     # Call Gemini (Classify)
-    system_prompt = "You are an assistant that classifies user requests. Respond only with a JSON object. The user's date is 2025-11-10."
+    system_prompt = f"You are an assistant that classifies user requests. Respond only with a JSON object. The user's date is {CLASSIFICATION_DEFAULT_DATE}."
     user_prompt = (
         f"Classify this prompt: '{prompt}'. Your JSON must have these keys: "
         f"'intent' (one of 'plan_day', 'refine_plan', 'compare_options'), "
@@ -59,7 +68,7 @@ async def stream_plan(prompt: str):
     }
 
     context: dict = {"classification": classification}
-    async with httpx.AsyncClient(timeout=15, headers=headers) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
         # 1) Geocode first (to obtain lat/lon)
         yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'pending'})}\n\n"
         try:
@@ -169,8 +178,8 @@ async def stream_plan(prompt: str):
                     "lat": float(lat),
                     "lon": float(lon),
                     "query": query,
-                    "radius_m": 3000,
-                    "limit": 1,
+                    "radius_m": NEARBY_RADIUS_M,
+                    "limit": NEARBY_LIMIT,
                 }
                 yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'pending', 'query': query})}\n\n"
                 r = await client.post(f"{MCP_TOOLS_URL}/geo/nearby", json=nearby_req)
@@ -191,7 +200,7 @@ async def stream_plan(prompt: str):
             try:
                 eta_req = {
                     "points": [{"lat": p["lat"], "lon": p["lon"]} for p in itinerary_points],
-                    "profile": "foot",
+                    "profile": ROUTE_PROFILE_DEFAULT,
                 }
                 yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'pending'})}\n\n"
                 r_eta = await client.post(f"{MCP_TOOLS_URL}/route/eta", json=eta_req)
@@ -244,7 +253,7 @@ async def stream_plan(prompt: str):
             from_ccy = m.group(2).upper()
             to_ccy = m.group(3).upper()
             try:
-                async with httpx.AsyncClient(timeout=10, headers=headers) as client_fx:
+                async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client_fx:
                     fx_body = {"amount": amount, "from": from_ccy, "to": to_ccy}
                     fx_resp = await client_fx.post(f"{MCP_TOOLS_URL}/fx/convert", json=fx_body)
                     fx_resp.raise_for_status()
@@ -267,5 +276,6 @@ async def plan_day(req: PlanRequest):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=3002)
+    port = int(os.getenv("PORT", "3002"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
