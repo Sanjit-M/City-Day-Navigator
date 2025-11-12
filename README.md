@@ -88,6 +88,7 @@ python3 client_cli/main.py -i
 # add a specialty coffee stop near the second venue
 # compare two options if it rains after 3 PM
 # convert 500000 Japanese Yen to Indian Rupee
+# EXPORT   # saves the last streamed itinerary to ./itinerary-YYYYmmdd-HHMMSS.md
 ```
 
 Notes:

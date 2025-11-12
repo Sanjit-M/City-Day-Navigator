@@ -6,6 +6,7 @@ import sys
 import json
 import os
 import uuid
+from datetime import datetime
 
 import typer
 import rich
@@ -101,6 +102,7 @@ def cli(
 
     # Construct initial prompt from arguments (if any)
     initial_prompt: Optional[str] = None
+    last_markdown: str = ""
     if prompt_str:
         initial_prompt = prompt_str
     elif city and date:
@@ -123,6 +125,7 @@ def cli(
     # Run the initial request if present
     if initial_prompt:
         md = run_once(initial_prompt)
+        last_markdown = md
         if output_file:
             try:
                 # Append results to output file (supports multiple turns)
@@ -139,15 +142,31 @@ def cli(
     if interactive or (initial_prompt is None):
         while True:
             try:
-                user_in = typer.prompt("Ask a follow-up or new request (type 'exit' to quit)")
+                user_in = typer.prompt('Ask a follow-up or new request. Type "EXPORT" to get the itinerary in Markdown (type \'exit\' to quit)')
             except (EOFError, KeyboardInterrupt):
                 break
             if not user_in:
                 continue
-            lower = user_in.strip().lower()
+            stripped = user_in.strip()
+            lower = stripped.lower()
+            if stripped == "EXPORT":
+                if not last_markdown:
+                    console.print("No itinerary available to export yet.", style="yellow")
+                    continue
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                export_path = Path.cwd() / f"itinerary-{ts}.md"
+                try:
+                    export_path.parent.mkdir(parents=True, exist_ok=True)
+                    with export_path.open("w", encoding="utf-8") as f:
+                        f.write(last_markdown)
+                    console.print(f"Exported itinerary to {export_path}", style="green")
+                except Exception as e:
+                    trace_console.print(f"Failed to export: {e}", style="bold red")
+                continue
             if lower in {"exit", "quit", "q"}:
                 break
-            md = run_once(user_in.strip())
+            md = run_once(stripped)
+            last_markdown = md
             if output_file and md:
                 try:
                     output_file.parent.mkdir(parents=True, exist_ok=True)
