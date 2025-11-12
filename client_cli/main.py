@@ -14,11 +14,19 @@ import httpx
 
 app = typer.Typer()
 console = Console()
+trace_console = Console(stderr=True)
 
 
 @app.command()
 def cli(
-    prompt: str = typer.Argument(..., help="The prompt for the city day planner."),
+    prompt_str: Optional[str] = typer.Option(
+        None, "--prompt", help="A full, free-form prompt to send to the orchestrator."
+    ),
+    city: Optional[str] = typer.Argument(None, help="The city for the itinerary (if not using --prompt)."),
+    date: Optional[str] = typer.Argument(None, help="The date for the itinerary (YYYY-MM-DD, if not using --prompt)."),
+    preferences: Optional[list[str]] = typer.Option(
+        None, "--prefer", "-p", help="Preferences for the itinerary (e.g., 'museums', 'walkable')."
+    ),
     output_file: Optional[Path] = typer.Option(
         None, "--output", "-o", help="Save Markdown to file."
     ),
@@ -27,12 +35,27 @@ def cli(
     orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:3002")
     url = f"{orchestrator_url.rstrip('/')}/plan-day"
 
+    # Construct prompt from arguments
+    final_prompt = ""
+    if prompt_str:
+        final_prompt = prompt_str
+    elif city and date:
+        final_prompt = f"Plan a day in {city} on {date}."
+        if preferences:
+            final_prompt += f" Preferences: {', '.join(preferences)}."
+    else:
+        console.print(
+            "Error: You must provide either a full prompt with --prompt, or a city and date.",
+            style="bold red",
+        )
+        raise typer.Exit(code=1)
+
     with console.status("Planning your day..."):
         try:
             with httpx.stream(
                 "POST",
                 url,
-                json={"prompt": prompt},
+                json={"prompt": final_prompt},
                 headers={"Accept": "text/event-stream", "Content-Type": "application/json"},
                 timeout=60,
             ) as resp:
@@ -65,24 +88,20 @@ def cli(
                             service = payload.get("service")
                             fn = payload.get("fn")
                             status = payload.get("status")
-                            console.print(
-                                f"[trace] {service}:{fn} -> {status}",
-                                style="dim",
-                                file=sys.stderr,
-                            )
+                            trace_console.print(f"[trace] {service}:{fn} -> {status}", style="dim")
                         elif ptype == "error":
                             content = payload.get("content", "Unknown error")
-                            console.print(content, style="bold red", file=sys.stderr)
+                            trace_console.print(content, style="bold red")
                         # ignore other types
         except httpx.HTTPError as e:
-            console.print(f"Request failed: {e}", style="bold red", file=sys.stderr)
+            trace_console.print(f"Request failed: {e}", style="bold red")
 
     if output_file:
         try:
             output_file.write_text(markdown_output, encoding="utf-8")
             console.print(f"\nSaved itinerary to {output_file}", style="green")
         except Exception as e:
-            console.print(f"Failed to write file: {e}", style="bold red", file=sys.stderr)
+            trace_console.print(f"Failed to write file: {e}", style="bold red")
 
 
 if __name__ == "__main__":

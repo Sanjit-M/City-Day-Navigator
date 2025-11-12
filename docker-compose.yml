@@ -1,7 +1,9 @@
 version: "3.9"
 services:
   mcp_tools:
-    build: ./mcp_tools
+    build:
+      context: .
+      dockerfile: mcp_tools/Dockerfile
     command: uvicorn mcp_tools.main:app --host 0.0.0.0 --port 3001
     ports:
       - "3001:3001"
@@ -13,15 +15,26 @@ services:
       - MCP_RATE_LIMIT=${MCP_RATE_LIMIT:-30/minute}
       - MCP_USER_AGENT=${MCP_USER_AGENT:-CityDayNavigator-MCP-Tool}
       - HTTP_TIMEOUT_SEC=${HTTP_TIMEOUT_SEC:-10}
+      - EXCHANGERATE_API_KEY=${EXCHANGERATE_API_KEY:-your_api_key_here}
+      - OPENAQ_API_KEY=${OPENAQ_API_KEY:-your_api_key_here}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -H 'X-API-KEY: ${MCP_API_KEY:-dev-key}' http://localhost:3001/ >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
   orchestrator:
-    build: ./orchestrator
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
     command: uvicorn orchestrator.main:app --host 0.0.0.0 --port 3002
     ports:
       - "3002:3002"
     env_file:
       - .env
     depends_on:
-      - mcp_tools
+      mcp_tools:
+        condition: service_healthy
     environment:
       - PORT=3002
       - MCP_API_KEY=${MCP_API_KEY:-dev-key}
@@ -33,4 +46,4 @@ services:
       - NEARBY_RADIUS_M=${NEARBY_RADIUS_M:-3000}
       - NEARBY_LIMIT=${NEARBY_LIMIT:-1}
       - ROUTE_PROFILE_DEFAULT=${ROUTE_PROFILE_DEFAULT:-foot}
-
+    restart: unless-stopped

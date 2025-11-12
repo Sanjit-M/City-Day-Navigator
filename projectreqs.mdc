@@ -7,8 +7,8 @@ alwaysApply: true
 Given a city and time window, build a copilot that plans a day: checks weather and air quality, finds nearby points of interest and events, estimates travel time, converts currency, and streams a concise plan with alternatives. Must use Gemini for reasoning and summaries, and MCP to call APIs.
 
 ### Required external APIs (no-key or free tiers)
-- Open-Meteo (weather forecast): `https://api.open-meteo.com/v1/forecast`
-- OpenAQ (air quality): `https://api.openaq.org/v2/measurements`
+- Open-Meteo (weather forecast): 
+- OpenAQ (air quality): 
 - Nominatim / OpenStreetMap (geocoding + places): `https://nominatim.openstreetmap.org/search` and `https://nominatim.openstreetmap.org/reverse`
 - OSRM demo (routing and ETAs): `https://router.project-osrm.org/route/v1/{profile}/{lon},{lat};{lon},{lat}`
 - Nager.Date (public holidays): `https://date.nager.at/api/v3/PublicHolidays/{year}/{countryCode}`

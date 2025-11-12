@@ -1,0 +1,7 @@
+pytest
+pytest-asyncio
+httpx
+respx
+anyio
+freezegun
+

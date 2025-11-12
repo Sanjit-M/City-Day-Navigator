@@ -3,6 +3,7 @@ import os
 import json
 import httpx
 import re
+import time
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
@@ -10,6 +11,80 @@ from pydantic import BaseModel
 import google.generativeai as genai
 import uvicorn
 
+
+CURRENCY_MAP = {
+    # Symbols
+    "$": "USD",
+    "€": "EUR",
+    "£": "GBP",
+    "¥": "JPY",
+    "₹": "INR",
+    "₩": "KRW",
+    "฿": "THB",
+    "A$": "AUD",
+    "C$": "CAD",
+    "CHF": "CHF",
+    "CN¥": "CNY",
+    "kr": "SEK", # Also NOK, DKK
+    "NZ$": "NZD",
+    "Mex$": "MXN",
+    "S$": "SGD",
+    "HK$": "HKD",
+    "₺": "TRY",
+    "₽": "RUB",
+    "R$": "BRL",
+    "R": "ZAR",
+    # Names (lowercase)
+    "dollar": "USD",
+    "dollars": "USD",
+    "usd": "USD",
+    "euro": "EUR",
+    "euros": "EUR",
+    "eur": "EUR",
+    "pound": "GBP",
+    "pounds": "GBP",
+    "gbp": "GBP",
+    "yen": "JPY",
+    "jpy": "JPY",
+    "rupee": "INR",
+    "rupees": "INR",
+    "inr": "INR",
+    "won": "KRW",
+    "korean won": "KRW",
+    "krw": "KRW",
+    "baht": "THB",
+    "thai baht": "THB",
+    "thb": "THB",
+    "australian dollar": "AUD",
+    "aud": "AUD",
+    "canadian dollar": "CAD",
+    "cad": "CAD",
+    "swiss franc": "CHF",
+    "chf": "CHF",
+    "yuan": "CNY",
+    "renminbi": "CNY",
+    "cny": "CNY",
+    "swedish krona": "SEK",
+    "sek": "SEK",
+    "new zealand dollar": "NZD",
+    "nzd": "NZD",
+    "mexican peso": "MXN",
+    "mxn": "MXN",
+    "singapore dollar": "SGD",
+    "sgd": "SGD",
+    "hong kong dollar": "HKD",
+    "hkd": "HKD",
+    "norwegian krone": "NOK",
+    "nok": "NOK",
+    "turkish lira": "TRY",
+    "try": "TRY",
+    "russian ruble": "RUB",
+    "rub": "RUB",
+    "brazilian real": "BRL",
+    "brl": "BRL",
+    "south african rand": "ZAR",
+    "zar": "ZAR",
+}
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -24,7 +99,12 @@ try:
     HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "15"))
 except ValueError:
     HTTP_TIMEOUT_SEC = 15.0
-model = genai.GenerativeModel(GEMINI_MODEL)
+model = genai.GenerativeModel(
+    GEMINI_MODEL,
+    generation_config={"response_mime_type": "application/json"},
+)
+# New model for text generation
+text_model = genai.GenerativeModel(GEMINI_MODEL)
 
 
 class PlanRequest(BaseModel):
@@ -43,21 +123,24 @@ async def stream_plan(prompt: str):
         f"'city' (string), 'date' (YYYY-MM-DD), 'country_code' (2-letter ISO), "
         f"'preferences' (list of strings)."
     )
+    t0 = time.monotonic()
     yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'classify', 'status': 'pending'})}\n\n"
     try:
         response = await model.generate_content_async([system_prompt, user_prompt])
         text = getattr(response, "text", None) or ""
-        classification = json.loads(text)
+        try:
+            classification = json.loads(text)
+        except json.JSONDecodeError:
+            m = re.search(r"\{.*\}", text, re.S)
+            if not m:
+                raise
+            classification = json.loads(m.group(0))
     except Exception as e:
         err = {'type': 'error', 'content': f'Classification failed: {str(e)}'}
         yield f"data: {json.dumps(err)}\n\n"
         return
-    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'classify', 'status': 'complete', 'result': classification})}\n\n"
-
-    # Handle intent
-    if classification.get('intent') != 'plan_day':
-        yield f"data: {json.dumps({'type': 'error', 'content': 'This demo only supports plan_day intent.'})}\n\n"
-        return
+    duration_ms = (time.monotonic() - t0) * 1000
+    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'classify', 'status': 'complete', 'duration_ms': f'{duration_ms:.2f}', 'result': classification})}\n\n"
 
     # Prepare HTTP client for MCP tools
     headers = {
@@ -66,10 +149,67 @@ async def stream_plan(prompt: str):
         "Accept": "application/json",
         "User-Agent": "CityDayNavigator-Orchestrator",
     }
-
     context: dict = {"classification": classification}
+
+    # Handle standalone FX query BEFORE 'plan_day' check
+    lower_prompt = prompt.lower()
+    fx_keywords = ["convert", "exchange", "fx", "rate"]
+    currency_symbols_or_codes = [
+        "$", "€", "£", "¥", "₹", "₩", "฿", "A$", "C$", "CHF", "CN¥", "kr", "NZ$",
+        "Mex$", "S$", "HK$", "₺", "₽", "R$", "R",
+        "usd", "eur", "gbp", "jpy", "inr", "krw", "thb", "aud", "cad", "chf",
+        "cny", "sek", "nzd", "mxn", "sgd", "hkd", "nok", "try", "rub", "brl", "zar",
+    ]
+    fx_triggered = any(kw in lower_prompt for kw in fx_keywords) or any(c in lower_prompt for c in currency_symbols_or_codes)
+
+    if fx_triggered and classification.get('intent') != 'plan_day':
+        currency_pattern = r"([A-Za-z\s]{3,}|[\$€£¥₹₩฿₽₺]|A\$|C\$|NZ\$|Mex\$|S\$|HK\$|R\$|R|kr|CHF|CN¥)"
+        m = re.search(
+            r"(\d+(?:\.\d+)?)\s*" + currency_pattern + r"\s*(?:to|in|->|=)\s*" + currency_pattern,
+            prompt,
+            re.IGNORECASE,
+        )
+        if m:
+            try:
+                async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
+                    amount_str, from_str, to_str = m.group(1), m.group(2).strip(), m.group(3).strip()
+                    amount = float(amount_str)
+                    from_ccy = CURRENCY_MAP.get(from_str.lower(), from_str.upper())
+                    to_ccy = CURRENCY_MAP.get(to_str.lower(), to_str.upper())
+
+                    if len(from_ccy) == 3 and len(to_ccy) == 3:
+                        t_fx = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'pending'})}\n\n"
+                        fx_body = {"amount": amount, "from": from_ccy, "to": to_ccy}
+                        fx_resp = await client.post(f"{MCP_TOOLS_URL}/fx/convert", json=fx_body)
+                        fx_resp.raise_for_status()
+                        fx_data = fx_resp.json()
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_fx)*1000:.2f}', 'result': fx_data})}\n\n"
+
+                        rate = fx_data.get('rate', 'N/A')
+                        converted = fx_data.get('converted', 'N/A')
+                        summary = (
+                            f"## Currency Conversion\n\n"
+                            f"| From | To | Rate | Result |\n"
+                            f"| :--- | :--- | :--- | :--- |\n"
+                            f"| {amount} {from_ccy} | {to_ccy} | {rate} | **{converted} {to_ccy}** |\n"
+                        )
+                        yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'error', 'error': str(e)})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+    # Handle intent
+    if classification.get('intent') != 'plan_day':
+        yield f"data: {json.dumps({'type': 'error', 'content': 'This demo only supports plan_day intent.'})}\n\n"
+        return
+
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
         # 1) Geocode first (to obtain lat/lon)
+        t1 = time.monotonic()
         yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'pending'})}\n\n"
         try:
             geo_req = {
@@ -80,7 +220,8 @@ async def stream_plan(prompt: str):
             geo_resp.raise_for_status()
             geocode_data = geo_resp.json()
             context["geocode"] = geocode_data
-            yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'complete', 'result': geocode_data})}\n\n"
+            duration_ms = (time.monotonic() - t1) * 1000
+            yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'complete', 'duration_ms': f'{duration_ms:.2f}', 'result': geocode_data})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'error', 'error': str(e)})}\n\n"
             return
@@ -96,9 +237,9 @@ async def stream_plan(prompt: str):
 
         # 2) Weather, Air, Holidays in parallel
         # Emit pending traces
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'pending'})}\n\n"
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'pending'})}\n\n"
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'pending'})}\n\n"
+        t_weather = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'pending'})}\n\n"
+        t_air = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'pending'})}\n\n"
+        t_hol = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'pending'})}\n\n"
 
         async def call_weather():
             try:
@@ -135,9 +276,9 @@ async def stream_plan(prompt: str):
         context["holidays"] = holidays_data
 
         # Emit complete traces
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'complete', 'result': weather_data})}\n\n"
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'complete', 'result': air_data})}\n\n"
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'complete', 'result': holidays_data})}\n\n"
+        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_weather)*1000:.2f}', 'result': weather_data})}\n\n"
+        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_air)*1000:.2f}', 'result': air_data})}\n\n"
+        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_hol)*1000:.2f}', 'result': holidays_data})}\n\n"
 
         # Call Gemini (Planner) to propose venues
         prefs = classification.get("preferences") or []
@@ -156,7 +297,7 @@ async def stream_plan(prompt: str):
             "Prefer indoor options if precipitation probability > 60%. Respond ONLY with a JSON array of strings.\n\n"
             f"Context:\n{json.dumps(planning_context)}"
         )
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'pending'})}\n\n"
+        t_plan = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'pending'})}\n\n"
         try:
             venues_response = await model.generate_content_async(planner_prompt)
             venues_text = getattr(venues_response, "text", None) or ""
@@ -167,7 +308,7 @@ async def stream_plan(prompt: str):
             yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'error', 'error': str(e)})}\n\n"
             yield f"data: {json.dumps({'type': 'error', 'content': 'Planning failed.'})}\n\n"
             return
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'complete', 'result': venue_list})}\n\n"
+        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_plan)*1000:.2f}', 'result': venue_list})}\n\n"
 
         # Get Venue Details & ETAs
         itinerary_points: list[dict] = []
@@ -181,11 +322,11 @@ async def stream_plan(prompt: str):
                     "radius_m": NEARBY_RADIUS_M,
                     "limit": NEARBY_LIMIT,
                 }
-                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'pending', 'query': query})}\n\n"
+                t_nb = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'pending', 'query': query})}\n\n"
                 r = await client.post(f"{MCP_TOOLS_URL}/geo/nearby", json=nearby_req)
                 r.raise_for_status()
                 nearby_data = r.json()
-                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'complete', 'result': nearby_data})}\n\n"
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_nb)*1000:.2f}', 'result': nearby_data})}\n\n"
                 items = nearby_data.get("results") or []
                 if not items:
                     continue
@@ -202,23 +343,62 @@ async def stream_plan(prompt: str):
                     "points": [{"lat": p["lat"], "lon": p["lon"]} for p in itinerary_points],
                     "profile": ROUTE_PROFILE_DEFAULT,
                 }
-                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'pending'})}\n\n"
+                t_eta = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'pending'})}\n\n"
                 r_eta = await client.post(f"{MCP_TOOLS_URL}/route/eta", json=eta_req)
                 r_eta.raise_for_status()
                 eta_data = r_eta.json()
                 context["eta"] = eta_data
-                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'complete', 'result': eta_data})}\n\n"
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_eta)*1000:.2f}', 'result': eta_data})}\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'error', 'error': str(e)})}\n\n"
         context["itinerary_points"] = itinerary_points
+
+        # Handle FX if requested in prompt
+        lower_prompt = prompt.lower()
+        fx_keywords = ["convert", "exchange", "fx", "rate"]
+        currency_symbols_or_codes = [
+            "$", "€", "£", "¥", "₹", "₩", "฿", "A$", "C$", "CHF", "CN¥", "kr", "NZ$",
+            "Mex$", "S$", "HK$", "₺", "₽", "R$", "R",
+            "usd", "eur", "gbp", "jpy", "inr", "krw", "thb", "aud", "cad", "chf",
+            "cny", "sek", "nzd", "mxn", "sgd", "hkd", "nok", "try", "rub", "brl", "zar",
+        ]
+        fx_triggered = any(kw in lower_prompt for kw in fx_keywords) or any(c in lower_prompt for c in currency_symbols_or_codes)
+        if fx_triggered:
+            # More robust currency pattern
+            currency_pattern = r"([A-Za-z\s]{3,}|[\$€£¥₹₩฿₽₺]|A\$|C\$|NZ\$|Mex\$|S\$|HK\$|R\$|R|kr|CHF|CN¥)"
+            m = re.search(
+                r"(\d+(?:\.\d+)?)\s*" + currency_pattern + r"\s*(?:to|in|->|=)\s*" + currency_pattern,
+                prompt,
+                re.IGNORECASE,
+            )
+            if m:
+                try:
+                    amount_str, from_str, to_str = m.group(1), m.group(2).strip(), m.group(3).strip()
+                    amount = float(amount_str)
+                    from_ccy = CURRENCY_MAP.get(from_str.lower(), from_str.upper())
+                    to_ccy = CURRENCY_MAP.get(to_str.lower(), to_str.upper())
+
+                    if len(from_ccy) == 3 and len(to_ccy) == 3:
+                        t_fx = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'pending'})}\n\n"
+                        fx_body = {"amount": amount, "from": from_ccy, "to": to_ccy}
+                        fx_resp = await client.post(f"{MCP_TOOLS_URL}/fx/convert", json=fx_body)
+                        fx_resp.raise_for_status()
+                        fx_data = fx_resp.json()
+                        context["fx"] = fx_data
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_fx)*1000:.2f}', 'result': fx_data})}\n\n"
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'error', 'error': str(e)})}\n\n"
+
 
     # Call Gemini (Summarizer & Final Plan)
     final_system = (
         "You are a trip-planning assistant. Produce a complete, user-friendly Markdown itinerary. "
         "Follow these rules strictly: "
-        "1) If rain probability > 60%, provide an indoor-heavy alternative section. "
-        "2) If PM2.5 > 75 μg/m³, add 'mask recommended' to outdoor segments or suggest indoor swaps. "
-        "3) If it's a public holiday, add a caution about closures or crowds. "
+        "1) Insert travel legs with ETAs between itinerary points. "
+        "2) If rain probability > 60%, provide an indoor-heavy alternative section. "
+        "3) If PM2.5 > 75 μg/m³, add 'mask recommended' to outdoor segments or suggest indoor swaps. "
+        "4) If it's a public holiday, add a caution about closures or crowds. "
+        "5) If the context includes 'fx' data, add a formatted 'Currency Conversion' section. "
         "Include concise reasoning notes."
     )
     summary_context = {
@@ -228,11 +408,12 @@ async def stream_plan(prompt: str):
         "holidays": context.get("holidays"),
         "eta": context.get("eta"),
         "itinerary_points": context.get("itinerary_points"),
+        "fx": context.get("fx"),
     }
     summary_prompt = f"{final_system}\n\nContext:\n{json.dumps(summary_context)}\n\nGenerate the Markdown itinerary now."
-    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize', 'status': 'pending'})}\n\n"
+    t_sum = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize', 'status': 'pending'})}\n\n"
     try:
-        response_stream = await model.generate_content_async(summary_prompt, stream=True)
+        response_stream = await text_model.generate_content_async(summary_prompt, stream=True)
         async for chunk in response_stream:
             text = getattr(chunk, 'text', '') or ''
             if text:
@@ -240,31 +421,7 @@ async def stream_plan(prompt: str):
     except Exception as e:
         yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize', 'status': 'error', 'error': str(e)})}\n\n"
     else:
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize', 'status': 'complete'})}\n\n"
-
-    # Handle FX if requested in prompt
-    lower_prompt = prompt.lower()
-    fx_triggered = ("convert" in lower_prompt) or any(sym in prompt for sym in ["$", "€", "£", "¥", "₹"])
-    if fx_triggered:
-        # Naive parse for patterns like "Convert 200 USD to JPY"
-        m = re.search(r'(\d+(?:\.\d+)?)\s*([A-Za-z]{3})\s*(?:to|in|->)\s*([A-Za-z]{3})', prompt, re.IGNORECASE)
-        if m:
-            amount = float(m.group(1))
-            from_ccy = m.group(2).upper()
-            to_ccy = m.group(3).upper()
-            try:
-                async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client_fx:
-                    fx_body = {"amount": amount, "from": from_ccy, "to": to_ccy}
-                    fx_resp = await client_fx.post(f"{MCP_TOOLS_URL}/fx/convert", json=fx_body)
-                    fx_resp.raise_for_status()
-                    fx_data = fx_resp.json()
-                    out = {
-                        "type": "plan_chunk",
-                        "content": f"FX: {amount} {from_ccy} -> {to_ccy} = {fx_data.get('converted')} (rate {fx_data.get('rate')})",
-                    }
-                    yield f"data: {json.dumps(out)}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'type': 'plan_chunk', 'content': f'FX conversion failed: {str(e)}'})}\n\n"
+        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_sum)*1000:.2f}'})}\n\n"
 
     # Signal completion
     yield "data: [DONE]\n\n"

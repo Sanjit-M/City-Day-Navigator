@@ -18,7 +18,7 @@ class _Config:
         # External API bases
         self.nominatim_base: str = os.getenv("NOMINATIM_BASE", "https://nominatim.openstreetmap.org")
         self.open_meteo_base: str = os.getenv("OPEN_METEO_BASE", "https://api.open-meteo.com/v1/forecast")
-        self.openaq_base: str = os.getenv("OPENAQ_BASE", "https://api.openaq.org/v2")
+        self.openaq_base: str = os.getenv("OPENAQ_BASE", "https://api.openaq.org/v3")
         self.osrm_base: str = os.getenv("OSRM_BASE", "https://router.project-osrm.org")
         self.nager_base: str = os.getenv("NAGER_BASE", "https://date.nager.at/api/v3")
         self.fx_base: str = os.getenv("FX_BASE", "https://api.exchangerate.host")

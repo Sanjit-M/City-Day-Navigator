@@ -1,4 +1,5 @@
 import os
+import logging
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -16,9 +17,19 @@ from .config import CONFIG
 from .deps import get_api_key
 
 
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler()  # Ensure logs go to stdout/stderr
+    ]
+)
+# --------------------------
+
 limiter = Limiter(key_func=get_remote_address, default_limits=[CONFIG.rate_limit])
 
-app = FastAPI(title="mcp_tools")
+app = FastAPI(title="MCP Tools")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
