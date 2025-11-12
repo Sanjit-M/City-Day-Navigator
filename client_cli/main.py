@@ -79,7 +79,18 @@ def cli(
                                 service = payload.get("service")
                                 fn = payload.get("fn")
                                 status = payload.get("status")
-                                trace_console.print(f"[trace] {service}:{fn} -> {status}", style="dim")
+                                dur = payload.get("duration_ms")
+                                if dur is not None:
+                                    try:
+                                        dur_float = float(dur)
+                                    except (TypeError, ValueError):
+                                        dur_float = None
+                                    if dur_float is not None:
+                                        trace_console.print(f"[trace] {service}:{fn} -> {status} ({dur_float:.2f} ms)", style="dim")
+                                    else:
+                                        trace_console.print(f"[trace] {service}:{fn} -> {status}", style="dim")
+                                else:
+                                    trace_console.print(f"[trace] {service}:{fn} -> {status}", style="dim")
                             elif ptype == "error":
                                 content = payload.get("content", "Unknown error")
                                 trace_console.print(content, style="bold red")

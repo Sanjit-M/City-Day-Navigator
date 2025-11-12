@@ -50,9 +50,11 @@ CURRENCY_MAP = {
     "pounds": "GBP",
     "gbp": "GBP",
     "yen": "JPY",
+    "japanese yen": "JPY",
     "jpy": "JPY",
     "rupee": "INR",
     "rupees": "INR",
+    "indian rupee": "INR",
     "inr": "INR",
     "won": "KRW",
     "korean won": "KRW",
@@ -121,6 +123,26 @@ app = FastAPI(title="City Day Navigator - Orchestrator")
 
 
 async def stream_plan(prompt: str, session_id: Optional[str]):
+    def normalize_currency(s: str) -> Optional[str]:
+        """Attempt to map a currency phrase to a 3-letter ISO code."""
+        if not s:
+            return None
+        s_norm = s.strip().lower()
+        code = CURRENCY_MAP.get(s_norm)
+        if code and len(code) == 3:
+            return code
+        # Try token-wise lookup (e.g., 'japanese yen' -> 'yen' -> 'JPY')
+        for token in reversed(re.split(r"[\s\-_]+", s_norm)):
+            if not token:
+                continue
+            code = CURRENCY_MAP.get(token)
+            if code and len(code) == 3:
+                return code
+        # If already a 3-letter code, normalize upper
+        if len(s_norm) == 3 and s_norm.isalpha():
+            return s_norm.upper()
+        return None
+    tool_traces = []  # collect completed tool calls with durations
     # Call Gemini (Classify)
     system_prompt = f"You are an assistant that classifies user requests. Respond only with a JSON object. The user's date is {CLASSIFICATION_DEFAULT_DATE}."
     user_prompt = (
@@ -147,6 +169,7 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
         return
     duration_ms = (time.monotonic() - t0) * 1000
     yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'classify', 'status': 'complete', 'duration_ms': f'{duration_ms:.2f}', 'result': classification})}\n\n"
+    tool_traces.append({'service': 'gemini', 'fn': 'classify', 'duration_ms': duration_ms})
 
     # Prepare HTTP client for MCP tools
     headers = {
@@ -180,8 +203,8 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                 async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
                     amount_str, from_str, to_str = m.group(1), m.group(2).strip(), m.group(3).strip()
                     amount = float(amount_str)
-                    from_ccy = CURRENCY_MAP.get(from_str.lower(), from_str.upper())
-                    to_ccy = CURRENCY_MAP.get(to_str.lower(), to_str.upper())
+                    from_ccy = normalize_currency(from_str)
+                    to_ccy = normalize_currency(to_str)
 
                     if len(from_ccy) == 3 and len(to_ccy) == 3:
                         t_fx = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'pending'})}\n\n"
@@ -189,7 +212,9 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                         fx_resp = await client.post(f"{MCP_TOOLS_URL}/fx/convert", json=fx_body)
                         fx_resp.raise_for_status()
                         fx_data = fx_resp.json()
-                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_fx)*1000:.2f}', 'result': fx_data})}\n\n"
+                        fx_dur_ms = (time.monotonic()-t_fx)*1000
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'complete', 'duration_ms': f'{fx_dur_ms:.2f}', 'result': fx_data})}\n\n"
+                        tool_traces.append({'service': 'mcp-fx', 'fn': 'convert', 'duration_ms': fx_dur_ms})
 
                         rate = fx_data.get('rate', 'N/A')
                         converted = fx_data.get('converted', 'N/A')
@@ -200,6 +225,12 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                             f"| {amount} {from_ccy} | {to_ccy} | {rate} | **{converted} {to_ccy}** |\n"
                         )
                         yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary})}\n\n"
+                        # Emit trace summary
+                        if tool_traces:
+                            summary_md = "### Tool trace summary\n\n| Service | Function | Duration (ms) |\n| :--- | :--- | ---: |\n"
+                            for tr in tool_traces:
+                                summary_md += f"| {tr['service']} | {tr['fn']} | {tr['duration_ms']:.2f} |\n"
+                            yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary_md})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
 
@@ -252,7 +283,14 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                 except Exception as e:
                     yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_compare', 'status': 'error', 'error': str(e)})}\n\n"
                 else:
-                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_compare', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_sum)*1000:.2f}'})}\n\n"
+                    sc_ms = (time.monotonic()-t_sum)*1000
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_compare', 'status': 'complete', 'duration_ms': f'{sc_ms:.2f}'})}\n\n"
+                    tool_traces.append({'service': 'gemini', 'fn': 'summarize_compare', 'duration_ms': sc_ms})
+                if tool_traces:
+                    summary_md = "### Tool trace summary\n\n| Service | Function | Duration (ms) |\n| :--- | :--- | ---: |\n"
+                    for tr in tool_traces:
+                        summary_md += f"| {tr['service']} | {tr['fn']} | {tr['duration_ms']:.2f} |\n"
+                    yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary_md})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
             elif intent == 'refine_plan':
@@ -298,7 +336,9 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                         yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues_refine', 'status': 'error', 'error': str(e)})}\n\n"
                         yield f"data: {json.dumps({'type': 'error', 'content': 'Refinement planning failed.'})}\n\n"
                         return
-                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues_refine', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_plan)*1000:.2f}', 'result': venue_list})}\n\n"
+                    pv_r_ms = (time.monotonic()-t_plan)*1000
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues_refine', 'status': 'complete', 'duration_ms': f'{pv_r_ms:.2f}', 'result': venue_list})}\n\n"
+                    tool_traces.append({'service': 'gemini', 'fn': 'plan_venues_refine', 'duration_ms': pv_r_ms})
 
                     # Nearby + ETA based on refined venues
                     headers = {
@@ -323,7 +363,9 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                                 r = await client.post(f"{MCP_TOOLS_URL}/geo/nearby", json=nearby_req)
                                 r.raise_for_status()
                                 nearby_data = r.json()
-                                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_nb)*1000:.2f}', 'result': nearby_data})}\n\n"
+                                nb_ms = (time.monotonic()-t_nb)*1000
+                                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'complete', 'duration_ms': f'{nb_ms:.2f}', 'result': nearby_data})}\n\n"
+                                tool_traces.append({'service': 'mcp-geo', 'fn': 'nearby', 'duration_ms': nb_ms})
                                 items = nearby_data.get("results") or []
                                 if not items:
                                     continue
@@ -344,7 +386,9 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                                 r_eta = await client.post(f"{MCP_TOOLS_URL}/route/eta", json=eta_req)
                                 r_eta.raise_for_status()
                                 eta_data = r_eta.json()
-                                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_eta)*1000:.2f}', 'result': eta_data})}\n\n"
+                                eta_ms = (time.monotonic()-t_eta)*1000
+                                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'complete', 'duration_ms': f'{eta_ms:.2f}', 'result': eta_data})}\n\n"
+                                tool_traces.append({'service': 'mcp-route', 'fn': 'eta', 'duration_ms': eta_ms})
                             except Exception as e:
                                 yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'error', 'error': str(e)})}\n\n"
 
@@ -384,7 +428,14 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                     except Exception as e:
                         yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_refined', 'status': 'error', 'error': str(e)})}\n\n"
                     else:
-                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_refined', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_sum)*1000:.2f}'})}\n\n"
+                        sr_ms = (time.monotonic()-t_sum)*1000
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_refined', 'status': 'complete', 'duration_ms': f'{sr_ms:.2f}'})}\n\n"
+                        tool_traces.append({'service': 'gemini', 'fn': 'summarize_refined', 'duration_ms': sr_ms})
+                    if tool_traces:
+                        summary_md = "### Tool trace summary\n\n| Service | Function | Duration (ms) |\n| :--- | :--- | ---: |\n"
+                        for tr in tool_traces:
+                            summary_md += f"| {tr['service']} | {tr['fn']} | {tr['duration_ms']:.2f} |\n"
+                        yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary_md})}\n\n"
                     yield "data: [DONE]\n\n"
                     return
 
@@ -403,6 +454,7 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
             context["geocode"] = geocode_data
             duration_ms = (time.monotonic() - t1) * 1000
             yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'complete', 'duration_ms': f'{duration_ms:.2f}', 'result': geocode_data})}\n\n"
+            tool_traces.append({'service': 'mcp-geo', 'fn': 'geocode', 'duration_ms': duration_ms})
         except Exception as e:
             yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'error', 'error': str(e)})}\n\n"
             return
@@ -457,9 +509,15 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
         context["holidays"] = holidays_data
 
         # Emit complete traces
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_weather)*1000:.2f}', 'result': weather_data})}\n\n"
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_air)*1000:.2f}', 'result': air_data})}\n\n"
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_hol)*1000:.2f}', 'result': holidays_data})}\n\n"
+        w_ms = (time.monotonic()-t_weather)*1000
+        a_ms = (time.monotonic()-t_air)*1000
+        h_ms = (time.monotonic()-t_hol)*1000
+        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'complete', 'duration_ms': f'{w_ms:.2f}', 'result': weather_data})}\n\n"
+        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'complete', 'duration_ms': f'{a_ms:.2f}', 'result': air_data})}\n\n"
+        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'complete', 'duration_ms': f'{h_ms:.2f}', 'result': holidays_data})}\n\n"
+        tool_traces.append({'service': 'mcp-weather', 'fn': 'forecast', 'duration_ms': w_ms})
+        tool_traces.append({'service': 'mcp-air', 'fn': 'aqi', 'duration_ms': a_ms})
+        tool_traces.append({'service': 'mcp-calendar', 'fn': 'holidays', 'duration_ms': h_ms})
 
         # Call Gemini (Planner) to propose venues
         prefs = classification.get("preferences") or []
@@ -489,7 +547,9 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
             yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'error', 'error': str(e)})}\n\n"
             yield f"data: {json.dumps({'type': 'error', 'content': 'Planning failed.'})}\n\n"
             return
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_plan)*1000:.2f}', 'result': venue_list})}\n\n"
+        pv_ms = (time.monotonic()-t_plan)*1000
+        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'complete', 'duration_ms': f'{pv_ms:.2f}', 'result': venue_list})}\n\n"
+        tool_traces.append({'service': 'gemini', 'fn': 'plan_venues', 'duration_ms': pv_ms})
 
         # Get Venue Details & ETAs
         itinerary_points: list[dict] = []
@@ -507,7 +567,9 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                 r = await client.post(f"{MCP_TOOLS_URL}/geo/nearby", json=nearby_req)
                 r.raise_for_status()
                 nearby_data = r.json()
-                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_nb)*1000:.2f}', 'result': nearby_data})}\n\n"
+                nb_ms = (time.monotonic()-t_nb)*1000
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'complete', 'duration_ms': f'{nb_ms:.2f}', 'result': nearby_data})}\n\n"
+                tool_traces.append({'service': 'mcp-geo', 'fn': 'nearby', 'duration_ms': nb_ms})
                 items = nearby_data.get("results") or []
                 if not items:
                     continue
@@ -529,7 +591,9 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                 r_eta.raise_for_status()
                 eta_data = r_eta.json()
                 context["eta"] = eta_data
-                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_eta)*1000:.2f}', 'result': eta_data})}\n\n"
+                eta_ms = (time.monotonic()-t_eta)*1000
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'complete', 'duration_ms': f'{eta_ms:.2f}', 'result': eta_data})}\n\n"
+                tool_traces.append({'service': 'mcp-route', 'fn': 'eta', 'duration_ms': eta_ms})
             except Exception as e:
                 yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'error', 'error': str(e)})}\n\n"
         context["itinerary_points"] = itinerary_points
@@ -556,8 +620,8 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                 try:
                     amount_str, from_str, to_str = m.group(1), m.group(2).strip(), m.group(3).strip()
                     amount = float(amount_str)
-                    from_ccy = CURRENCY_MAP.get(from_str.lower(), from_str.upper())
-                    to_ccy = CURRENCY_MAP.get(to_str.lower(), to_str.upper())
+                    from_ccy = normalize_currency(from_str)
+                    to_ccy = normalize_currency(to_str)
 
                     if len(from_ccy) == 3 and len(to_ccy) == 3:
                         t_fx = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'pending'})}\n\n"
@@ -566,7 +630,9 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                         fx_resp.raise_for_status()
                         fx_data = fx_resp.json()
                         context["fx"] = fx_data
-                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_fx)*1000:.2f}', 'result': fx_data})}\n\n"
+                        fx_ms = (time.monotonic()-t_fx)*1000
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'complete', 'duration_ms': f'{fx_ms:.2f}', 'result': fx_data})}\n\n"
+                        tool_traces.append({'service': 'mcp-fx', 'fn': 'convert', 'duration_ms': fx_ms})
                 except Exception as e:
                     yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'error', 'error': str(e)})}\n\n"
 
@@ -615,9 +681,16 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
     except Exception as e:
         yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize', 'status': 'error', 'error': str(e)})}\n\n"
     else:
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_sum)*1000:.2f}'})}\n\n"
+        sum_ms = (time.monotonic()-t_sum)*1000
+        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize', 'status': 'complete', 'duration_ms': f'{sum_ms:.2f}'})}\n\n"
+        tool_traces.append({'service': 'gemini', 'fn': 'summarize', 'duration_ms': sum_ms})
 
     # Signal completion
+    if tool_traces:
+        summary_md = "### Tool trace summary\n\n| Service | Function | Duration (ms) |\n| :--- | :--- | ---: |\n"
+        for tr in tool_traces:
+            summary_md += f"| {tr['service']} | {tr['fn']} | {tr['duration_ms']:.2f} |\n"
+        yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary_md})}\n\n"
     yield "data: [DONE]\n\n"
 
 

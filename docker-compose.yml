@@ -20,9 +20,10 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -sf -H 'X-API-KEY: ${MCP_API_KEY:-dev-key}' http://localhost:3001/ >/dev/null || exit 1"]
-      interval: 20s
+      interval: 2s
       timeout: 5s
-      retries: 5
+      retries: 15
+      start_period: 5s
   orchestrator:
     build:
       context: .
