@@ -3,7 +3,7 @@ from typing import Optional
 import logging
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -12,8 +12,10 @@ from pydantic import BaseModel
 from ..deps import get_api_key
 from ..config import CONFIG
 
+OPEN_METEO_AIR_BASE = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
 OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY")
+PLACEHOLDER_KEYS = {"your_api_key_here", "CHANGE_ME", ""}
 
 router = APIRouter(dependencies=[Depends(get_api_key)])
 
@@ -34,238 +36,210 @@ class AQIResponse(BaseModel):
 
 @router.post("/aqi", response_model=AQIResponse)
 async def aqi(req: AQIRequest) -> AQIResponse:
-    # --- Test hook for high AQI fallback ---
+    # Test hook to force high AQI path
     if req.date == "1999-12-30":
-        return AQIResponse(
-            pm25=80.0,
-            pm10=120.0,
-            no2=40.0,
-            o3=30.0,
-            category="Unhealthy",
-        )
-    # ------------------------------------
+        return AQIResponse(pm25=80.0, pm10=120.0, no2=40.0, o3=30.0, category="Unhealthy")
+
     start_time = time.monotonic()
-    if not OPENAQ_API_KEY:
+
+    # Validate key presence (OpenAQ v3 requires a key)
+    if not OPENAQ_API_KEY or OPENAQ_API_KEY in PLACEHOLDER_KEYS:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="OPENAQ_API_KEY not configured",
+            detail="OPENAQ_API_KEY not configured (set a valid key in environment)",
         )
 
-    params = {
-        # OpenAQ v3 expects coordinates as latitude,longitude
-        "coordinates": f"{req.lat},{req.lon}",
-        "radius": 25000,
-        "limit": 100,
-        "page": 1,
-        # v3 semantics
-        "order_by": "datetime",
-        "sort": "desc",
-        # Many v3 deployments prefer repeated parameters keys
-        "parameters": ["pm25", "pm10", "no2", "o3"],
-    }
-    if req.date:
-        # Prefer v3 datetime_*; some deployments may still accept date_*
-        params["datetime_from"] = f"{req.date}T00:00:00Z"
-        params["datetime_to"] = f"{req.date}T23:59:59Z"
+    # Ignore future dates; use latest instead
+    use_date: Optional[str] = req.date
+    try:
+        if use_date:
+            dt_req = datetime.strptime(use_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if dt_req > datetime.now(timezone.utc):
+                use_date = None
+    except Exception:
+        use_date = None
 
     headers = {
         "X-API-Key": OPENAQ_API_KEY,
         "User-Agent": CONFIG.user_agent,
+        "Accept": "application/json",
     }
 
-    def parse_results(items: list[dict]) -> dict[str, float]:
-        value_by_param: dict[str, float] = {}
-        for item in items:
-            p = item.get("parameter") or (item.get("parameter") or {})
-            # v3 may nest parameter details; try to reach a 'name'
-            if isinstance(p, dict):
-                p_name = p.get("name")
-            else:
-                p_name = p
-            v = item.get("value")
-            key = str(p_name) if p_name else None
-            if key in {"pm25", "pm10", "no2", "o3"} and key not in value_by_param:
+    def ensure_ok(code: int, body: str = "") -> None:
+        if code == 200:
+            return
+        if code in (401, 403):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="OpenAQ authentication/authorization failed (check OPENAQ_API_KEY)",
+            )
+        if code == 429:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="OpenAQ rate limit exceeded. Please retry later.",
+            )
+        if code >= 500:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="OpenAQ server error. Please retry later.",
+            )
+        # Other non-200s are treated as empty and will fall back
+
+    def parse_first_values(measurements: list[dict]) -> dict[str, float]:
+        values: dict[str, float] = {}
+        for m in measurements:
+            # v3 "measurements" entries usually expose 'parameter' and 'value'
+            p = m.get("parameter")
+            name = p.get("name") if isinstance(p, dict) else p
+            v = m.get("value")
+            if name in ("pm25", "pm10", "no2", "o3") and name not in values:
                 try:
-                    value_by_param[key] = float(v)
+                    values[name] = float(v)
                 except (TypeError, ValueError):
                     continue
-            if len(value_by_param) == 4:
+            if len(values) == 4:
                 break
-        return value_by_param
+        return values
 
-    async def fetch_measurements(client: httpx.AsyncClient, qparams: dict) -> tuple[int, dict]:
-        r = await client.get(f"{CONFIG.openaq_base}/measurements", params=qparams, headers=headers)
-        status_code = r.status_code
-        if status_code == 200:
-            return status_code, r.json()
-        return status_code, {}
-
-    async def fetch_locations(client: httpx.AsyncClient, lat: float, lon: float, radius: int) -> list[dict]:
-        # v3 locations accept coordinates as latitude,longitude
-        loc_params = {"coordinates": f"{lat},{lon}", "radius": radius, "limit": 20}
-        r = await client.get(f"{CONFIG.openaq_base}/locations", params=loc_params, headers=headers)
+    async def openaq_latest_nearby(client: httpx.AsyncClient, lat: float, lon: float, radius_m: int) -> dict[str, float]:
+        # Use repeated parameter keys to maximize compatibility
+        params_items: list[tuple[str, str | int | float]] = [
+            ("coordinates", f"{lat},{lon}"),
+            ("radius", radius_m),
+            ("limit", 50),
+        ]
+        for p in ("pm25", "pm10", "no2", "o3"):
+            params_items.append(("parameter", p))
+        r = await client.get(f"{CONFIG.openaq_base}/latest", params=params_items, headers=headers)
         if r.status_code != 200:
-            return []
-        data_loc = r.json()
-        return data_loc.get("results") or []
-    
-    def bbox_around(lat: float, lon: float, km: float) -> tuple[float, float, float, float]:
-        # Very rough bbox, adequate for search expansion
-        dlat = km / 111.0
-        dlon = km / (111.0 * max(0.1, abs(__import__("math").cos(__import__("math").radians(lat)))))
-        return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
+            ensure_ok(r.status_code, r.text)
+            return {}
+        data = r.json() or {}
+        results = data.get("results") or []
+        # Flatten measurements
+        measurements: list[dict] = []
+        for entry in results:
+            measurements.extend(entry.get("measurements") or [])
+        return parse_first_values(measurements)
+
+    async def openaq_measurements_for_location(
+        client: httpx.AsyncClient, location_id: int, date_str: Optional[str]
+    ) -> dict[str, float]:
+        params_items: list[tuple[str, str | int]] = [
+            ("location_id", location_id),
+            ("limit", 100),
+            ("order_by", "datetime"),
+            ("sort", "desc"),
+        ]
+        for p in ("pm25", "pm10", "no2", "o3"):
+            params_items.append(("parameter", p))
+        if date_str:
+            params_items.append(("datetime_from", f"{date_str}T00:00:00Z"))
+            params_items.append(("datetime_to", f"{date_str}T23:59:59Z"))
+        r = await client.get(f"{CONFIG.openaq_base}/measurements", params=params_items, headers=headers)
+        if r.status_code != 200:
+            ensure_ok(r.status_code, r.text)
+            return {}
+        data = r.json() or {}
+        items = data.get("results") or []
+        return parse_first_values(items)
+
+    async def openaq_find_nearest_location(client: httpx.AsyncClient, lat: float, lon: float, radius_m: int) -> Optional[int]:
+        params = {"coordinates": f"{lat},{lon}", "radius": radius_m, "limit": 20}
+        r = await client.get(f"{CONFIG.openaq_base}/locations", params=params, headers=headers)
+        if r.status_code != 200:
+            ensure_ok(r.status_code, r.text)
+            return None
+        data = r.json() or {}
+        results = data.get("results") or []
+        if not results:
+            return None
+        # Prefer locations advertising target parameters
+        def score(loc: dict) -> int:
+            names: list[str] = []
+            for s in loc.get("sensors", []) or []:
+                p = s.get("parameter") or {}
+                n = p.get("name")
+                if n:
+                    names.append(n)
+            for p in loc.get("parameters", []) or []:
+                n = p.get("name")
+                if n:
+                    names.append(n)
+            return sum(1 for n in names if n in ("pm25", "pm10", "no2", "o3"))
+
+        best = sorted(results, key=score, reverse=True)[0]
+        return best.get("id")
+
+    value_by_param: dict[str, float] = {}
+    http_status = 200
 
     try:
         async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
-            # Attempt 1: measurements by coordinates (+ optional datetime)
-            resp = await client.get(f"{CONFIG.openaq_base}/measurements", params=params, headers=headers)
-            data = {}
-            if resp.status_code == 200:
-                data = resp.json()
-            else:
-                # If not found/other error, fall back
-                data = {}
-            items = (data.get("results") or []) if isinstance(data, dict) else []
-            value_by_param = parse_results(items)
+            # 1) Try /latest near coordinates with widening radius
+            for r_m in (10000, 25000, 50000, 100000):
+                value_by_param = await openaq_latest_nearby(client, req.lat, req.lon, r_m)
+                if value_by_param:
+                    break
 
-            # Fallback if no data: search nearest location_id and fetch latest/dated measurements
+            # 2) If still empty, find nearest location and pull measurements (date-bound then latest)
             if not value_by_param:
-                # Try latest by coordinates directly (some deployments support this)
-                latest_by_coord_params = {
-                    "coordinates": f"{req.lat},{req.lon}",
-                    "radius": 25000,
-                    "limit": 100,
-                    "parameters": ["pm25", "pm10", "no2", "o3"],
-                }
-                r_latest_coord = await client.get(f"{CONFIG.openaq_base}/latest", params=latest_by_coord_params, headers=headers)
-                if r_latest_coord.status_code == 200:
-                    d_latest_coord = r_latest_coord.json()
-                    results_latest = d_latest_coord.get("results") or []
-                    flat = []
-                    for entry in results_latest:
-                        flat.extend(entry.get("measurements") or [])
-                    value_by_param = parse_results(flat)
-
-            if not value_by_param:
-                # Try increasing radius up to 25km (API limit)
-                for r_km in (10000, 25000):
-                    locs = await fetch_locations(client, req.lat, req.lon, r_km)
-                    # Prefer locations that list relevant parameters
-                    chosen = None
-                    for loc in locs:
-                        sensor_params = []
-                        # v3 may expose either sensors[].parameter.name or parameters[].name
-                        sensors = loc.get("sensors") or []
-                        for s in sensors:
-                            param = s.get("parameter") or {}
-                            name = param.get("name")
-                            if name:
-                                sensor_params.append(name)
-                        params_arr = loc.get("parameters") or []
-                        for p in params_arr:
-                            n = p.get("name")
-                            if n:
-                                sensor_params.append(n)
-                        if any(p in sensor_params for p in ("pm25", "pm10", "no2", "o3")):
-                            chosen = loc
-                            break
-                    if not chosen and locs:
-                        chosen = locs[0]
-                    if not chosen:
-                        continue
-                    loc_id = chosen.get("id")
-                    if not loc_id:
-                        continue
-                    # If date provided, try measurements by location_id; else latest
-                    if req.date:
-                        m_params = {
-                            "location_id": loc_id,
-                            "parameters": ["pm25", "pm10", "no2", "o3"],
-                            "order_by": "datetime",
-                            "sort": "desc",
-                            "limit": 100,
-                            "datetime_from": f"{req.date}T00:00:00Z",
-                            "datetime_to": f"{req.date}T23:59:59Z",
-                        }
-                        code2, data2 = await fetch_measurements(client, m_params)
-                        items2 = (data2.get("results") or []) if isinstance(data2, dict) else []
-                        value_by_param = parse_results(items2)
+                loc_id = await openaq_find_nearest_location(client, req.lat, req.lon, 100000)
+                if loc_id:
+                    if use_date:
+                        value_by_param = await openaq_measurements_for_location(client, loc_id, use_date)
                     if not value_by_param:
-                        # Latest by location_id
-                        latest_params = {"location_id": loc_id, "parameters": ["pm25", "pm10", "no2", "o3"], "limit": 100}
-                        r_latest = await client.get(f"{CONFIG.openaq_base}/latest", params=latest_params, headers=headers)
-                        if r_latest.status_code == 200:
-                            data_latest = r_latest.json()
-                            # v3 latest structure has 'results' each with 'measurements'
-                            results_latest = data_latest.get("results") or []
-                            flat = []
-                            for entry in results_latest:
-                                flat.extend(entry.get("measurements") or [])
-                            value_by_param = parse_results(flat)
-                    if value_by_param:
-                        break
-                # Final fallback: widen search via bbox (~50km) and pick nearest
-                if not value_by_param:
-                    min_dist = float("inf")
-                    chosen = None
-                    west, south, east, north = bbox_around(req.lat, req.lon, 50.0)
-                    bbox_params = {"bbox": f"{west},{south},{east},{north}", "limit": 50}
-                    r_box = await client.get(f"{CONFIG.openaq_base}/locations", params=bbox_params, headers=headers)
-                    if r_box.status_code == 200:
-                        data_b = r_box.json()
-                        for loc in data_b.get("results", []):
-                            coords = loc.get("coordinates") or {}
-                            la = coords.get("latitude"); lo = coords.get("longitude")
-                            if la is None or lo is None:
-                                continue
-                            # haversine-ish squared distance
-                            d = (float(la) - req.lat) ** 2 + (float(lo) - req.lon) ** 2
-                            names = []
-                            sensors = loc.get("sensors") or []
-                            for s in sensors:
-                                p = s.get("parameter") or {}
-                                n = p.get("name")
-                                if n:
-                                    names.append(n)
-                            params_arr = loc.get("parameters") or []
-                            for p in params_arr:
-                                n = p.get("name")
-                                if n:
-                                    names.append(n)
-                            if any(n in ("pm25", "pm10", "no2", "o3") for n in names) and d < min_dist:
-                                min_dist = d; chosen = loc
-                    if chosen:
-                        loc_id = chosen.get("id")
-                        if loc_id:
-                            latest_params = {"location_id": loc_id, "parameters": ["pm25","pm10","no2","o3"], "limit": 100}
-                            r_latest = await client.get(f"{CONFIG.openaq_base}/latest", params=latest_params, headers=headers)
-                            if r_latest.status_code == 200:
-                                data_latest = r_latest.json()
-                                results_latest = data_latest.get("results") or []
-                                flat = []
-                                for entry in results_latest:
-                                    flat.extend(entry.get("measurements") or [])
-                                value_by_param = parse_results(flat)
-            http_status = resp.status_code
-            ok = bool(value_by_param)
-    except httpx.HTTPError as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"OpenAQ request failed: {str(e)}",
-        )
+                        value_by_param = await openaq_measurements_for_location(client, loc_id, None)
 
-    latency_ms = (time.monotonic() - start_time) * 1000
-    # If still no data after fallbacks, return graceful 404
-    if not ok:
-        log_data = {
+            # 3) Last-resort fallback: Open‑Meteo Air Quality
+            if not value_by_param:
+                om_params = {
+                    "latitude": req.lat,
+                    "longitude": req.lon,
+                    "hourly": "pm2_5,pm10,ozone,nitrogen_dioxide",
+                    "timezone": "UTC",
+                }
+                if use_date:
+                    om_params["past_days"] = 1
+                    om_params["forecast_days"] = 1
+                r_om = await client.get(OPEN_METEO_AIR_BASE, params=om_params, headers={"User-Agent": CONFIG.user_agent})
+                if r_om.status_code == 200:
+                    d = r_om.json() or {}
+                    hourly = d.get("hourly") or {}
+                    times = hourly.get("time") or []
+                    pm25_arr = hourly.get("pm2_5") or []
+                    pm10_arr = hourly.get("pm10") or []
+                    o3_arr = hourly.get("ozone") or []
+                    no2_arr = hourly.get("nitrogen_dioxide") or []
+                    # pick middle/closest hour (best-effort)
+                    idx = len(times) // 2 if times else 0
+                    if times:
+                        try:
+                            # Try align to current UTC hour index if present
+                            now_hour = datetime.utcnow().strftime("%Y-%m-%dT%H:00")
+                            if now_hour in times:
+                                idx = times.index(now_hour)
+                        except Exception:
+                            pass
+                    if idx < len(pm25_arr): value_by_param["pm25"] = float(pm25_arr[idx])
+                    if idx < len(pm10_arr): value_by_param["pm10"] = float(pm10_arr[idx])
+                    if idx < len(o3_arr): value_by_param["o3"] = float(o3_arr[idx])
+                    if idx < len(no2_arr): value_by_param["no2"] = float(no2_arr[idx])
+                    # do not set http_status here; we only report 404 if completely empty
+
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Air quality request failed: {str(e)}")
+
+    if not value_by_param:
+        latency_ms = (time.monotonic() - start_time) * 1000
+        logging.info(json.dumps({
             "ts": datetime.utcnow().isoformat(),
             "tool": "mcp-air",
             "fn": "aqi",
             "latency_ms": f"{latency_ms:.2f}",
             "ok": False,
             "http_status": http_status,
-        }
-        logging.info(json.dumps(log_data))
+        }))
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No air quality data found nearby")
 
     pm25 = value_by_param.get("pm25")
@@ -280,14 +254,14 @@ async def aqi(req: AQIRequest) -> AQIResponse:
     else:
         category = "Good"
 
-    log_data = {
+    latency_ms = (time.monotonic() - start_time) * 1000
+    logging.info(json.dumps({
         "ts": datetime.utcnow().isoformat(),
         "tool": "mcp-air",
         "fn": "aqi",
         "latency_ms": f"{latency_ms:.2f}",
-        "ok": ok,
+        "ok": True,
         "http_status": http_status,
-    }
-    logging.info(json.dumps(log_data))
+    }))
     return AQIResponse(pm25=pm25, pm10=pm10, no2=no2, o3=o3, category=category)
 
