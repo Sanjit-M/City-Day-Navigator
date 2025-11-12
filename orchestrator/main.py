@@ -4,12 +4,17 @@ import json
 import httpx
 import re
 import time
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import google.generativeai as genai
 import uvicorn
+
+
+# In-memory session storage for interactive refinement
+SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
 CURRENCY_MAP = {
@@ -109,12 +114,13 @@ text_model = genai.GenerativeModel(GEMINI_MODEL)
 
 class PlanRequest(BaseModel):
     prompt: str
+    session_id: Optional[str] = None
 
 
 app = FastAPI(title="City Day Navigator - Orchestrator")
 
 
-async def stream_plan(prompt: str):
+async def stream_plan(prompt: str, session_id: Optional[str]):
     # Call Gemini (Classify)
     system_prompt = f"You are an assistant that classifies user requests. Respond only with a JSON object. The user's date is {CLASSIFICATION_DEFAULT_DATE}."
     user_prompt = (
@@ -202,10 +208,185 @@ async def stream_plan(prompt: str):
                 yield "data: [DONE]\n\n"
                 return
 
-    # Handle intent
-    if classification.get('intent') != 'plan_day':
-        yield f"data: {json.dumps({'type': 'error', 'content': 'This demo only supports plan_day intent.'})}\n\n"
-        return
+    # Handle non-plan intents with session support
+    intent = classification.get('intent')
+    if intent in ('refine_plan', 'compare_options'):
+        session_ctx = None
+        if session_id:
+            session_ctx = SESSIONS.get(session_id)
+        if not session_ctx:
+            # Fallback: if no prior context, downgrade to planning a fresh day
+            intent = 'plan_day'
+        else:
+            # We have prior context; branch per intent
+            if intent == 'compare_options':
+                # Produce two alternatives using existing context; no new tool calls required
+                summary_context = {
+                    "classification": session_ctx.get("classification"),
+                    "weather": session_ctx.get("weather"),
+                    "air": session_ctx.get("air"),
+                    "holidays": session_ctx.get("holidays"),
+                    "eta": session_ctx.get("eta"),
+                    "itinerary_points": session_ctx.get("itinerary_points"),
+                    "fx": session_ctx.get("fx"),
+                }
+                compare_system = (
+                    "You are a trip-planning assistant. Produce TWO alternative Markdown itineraries labeled "
+                    "'Option A' and 'Option B' for the same day and city using the provided context. "
+                    "Keep all formatting and guardrails (ETAs, indoor-alternative for rain > 60%, AQI caveats, holiday notes). "
+                    "Apply the user's comparison/refinement instruction to differentiate the options."
+                )
+                summary_prompt = (
+                    f"{compare_system}\n\n"
+                    f"User instruction: {prompt}\n\n"
+                    f"Context:\n{json.dumps(summary_context)}\n\n"
+                    "Generate the two Markdown options now."
+                )
+                t_sum = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_compare', 'status': 'pending'})}\n\n"
+                try:
+                    response_stream = await text_model.generate_content_async(summary_prompt, stream=True)
+                    async for chunk in response_stream:
+                        text = getattr(chunk, 'text', '') or ''
+                        if text:
+                            yield f"data: {json.dumps({'type': 'plan_chunk', 'content': text})}\n\n"
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_compare', 'status': 'error', 'error': str(e)})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_compare', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_sum)*1000:.2f}'})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            elif intent == 'refine_plan':
+                # Re-plan venues with refinement, then proceed similarly to plan_day flow using prior geocode/weather/air/holidays
+                lat = session_ctx.get("geocode", {}).get("lat")
+                lon = session_ctx.get("geocode", {}).get("lon")
+                date = session_ctx.get("classification", {}).get("date")
+                country_code = session_ctx.get("classification", {}).get("country_code")
+                prefs = classification.get("preferences") or session_ctx.get("classification", {}).get("preferences") or []
+                if lat is None or lon is None:
+                    # If for some reason geocode missing, drop to fresh plan
+                    intent = 'plan_day'
+                else:
+                    # Build refinement-aware planner prompt including previous venues
+                    previous_points = session_ctx.get("itinerary_points") or []
+                    previous_names = [p.get("name") for p in previous_points if p.get("name")]
+                    planning_context = {
+                        "weather": session_ctx.get("weather"),
+                        "air": session_ctx.get("air"),
+                        "holidays": session_ctx.get("holidays"),
+                        "preferences": prefs,
+                        "city": session_ctx.get("classification", {}).get("city"),
+                        "date": date,
+                        "country_code": country_code,
+                        "current_venues": previous_names,
+                        "refinement_instruction": prompt,
+                    }
+                    planner_prompt = (
+                        "Refine the existing itinerary's venue list based on the refinement instruction while keeping "
+                        "the day coherent. Respond ONLY with a JSON array of 4-6 venue names/types. "
+                        "If the instruction mentions a relative position (e.g., 'second venue'), interpret it relative "
+                        "to current_venues and adjust accordingly.\n\n"
+                        f"Context:\n{json.dumps(planning_context)}"
+                    )
+                    t_plan = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues_refine', 'status': 'pending'})}\n\n"
+                    try:
+                        venues_response = await model.generate_content_async(planner_prompt)
+                        venues_text = getattr(venues_response, "text", None) or ""
+                        venue_list = json.loads(venues_text)
+                        if not isinstance(venue_list, list):
+                            raise ValueError("Planner did not return a list")
+                    except Exception as e:
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues_refine', 'status': 'error', 'error': str(e)})}\n\n"
+                        yield f"data: {json.dumps({'type': 'error', 'content': 'Refinement planning failed.'})}\n\n"
+                        return
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues_refine', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_plan)*1000:.2f}', 'result': venue_list})}\n\n"
+
+                    # Nearby + ETA based on refined venues
+                    headers = {
+                        "X-API-KEY": MCP_API_KEY or "",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "User-Agent": "CityDayNavigator-Orchestrator",
+                    }
+                    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
+                        itinerary_points: list[dict] = []
+                        for venue in venue_list:
+                            try:
+                                query = str(venue)
+                                nearby_req = {
+                                    "lat": float(lat),
+                                    "lon": float(lon),
+                                    "query": query,
+                                    "radius_m": NEARBY_RADIUS_M,
+                                    "limit": NEARBY_LIMIT,
+                                }
+                                t_nb = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'pending', 'query': query})}\n\n"
+                                r = await client.post(f"{MCP_TOOLS_URL}/geo/nearby", json=nearby_req)
+                                r.raise_for_status()
+                                nearby_data = r.json()
+                                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_nb)*1000:.2f}', 'result': nearby_data})}\n\n"
+                                items = nearby_data.get("results") or []
+                                if not items:
+                                    continue
+                                top = items[0]
+                                itinerary_points.append({"name": query, "lat": top.get("lat"), "lon": top.get("lon")})
+                            except Exception as e:
+                                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'nearby', 'status': 'error', 'error': str(e), 'query': str(venue)})}\n\n"
+                                continue
+
+                        eta_data = None
+                        if len(itinerary_points) >= 2:
+                            try:
+                                eta_req = {
+                                    "points": [{"lat": p["lat"], "lon": p["lon"]} for p in itinerary_points],
+                                    "profile": ROUTE_PROFILE_DEFAULT,
+                                }
+                                t_eta = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'pending'})}\n\n"
+                                r_eta = await client.post(f"{MCP_TOOLS_URL}/route/eta", json=eta_req)
+                                r_eta.raise_for_status()
+                                eta_data = r_eta.json()
+                                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_eta)*1000:.2f}', 'result': eta_data})}\n\n"
+                            except Exception as e:
+                                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'error', 'error': str(e)})}\n\n"
+
+                    # Update session context and summarize refined plan
+                    new_context = {
+                        "classification": session_ctx.get("classification"),
+                        "weather": session_ctx.get("weather"),
+                        "air": session_ctx.get("air"),
+                        "holidays": session_ctx.get("holidays"),
+                        "eta": eta_data,
+                        "itinerary_points": itinerary_points,
+                        "fx": session_ctx.get("fx"),
+                        "geocode": session_ctx.get("geocode"),
+                    }
+                    if session_id:
+                        SESSIONS[session_id] = new_context
+
+                    final_system = (
+                        "You are a trip-planning assistant. Produce a complete, user-friendly Markdown itinerary. "
+                        "Follow these rules strictly: "
+                        "1) Insert travel legs with ETAs between itinerary points. "
+                        "2) If rain probability > 60%, provide an indoor-heavy alternative section. "
+                        "3) If PM2.5 > 75 μg/m³, add 'mask recommended' to outdoor segments or suggest indoor swaps. "
+                        "4) If it's a public holiday, add a caution about closures or crowds. "
+                        "5) If the context includes 'fx' data, add a formatted 'Currency Conversion' section. "
+                        "Include concise reasoning notes. State applied refinement explicitly."
+                    )
+                    summary_context = new_context
+                    summary_prompt = f"{final_system}\n\nApplied refinement: {prompt}\n\nContext:\n{json.dumps(summary_context)}\n\nGenerate the Markdown itinerary now."
+                    t_sum = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_refined', 'status': 'pending'})}\n\n"
+                    try:
+                        response_stream = await text_model.generate_content_async(summary_prompt, stream=True)
+                        async for chunk in response_stream:
+                            text = getattr(chunk, 'text', '') or ''
+                            if text:
+                                yield f"data: {json.dumps({'type': 'plan_chunk', 'content': text})}\n\n"
+                    except Exception as e:
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_refined', 'status': 'error', 'error': str(e)})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'summarize_refined', 'status': 'complete', 'duration_ms': f'{(time.monotonic()-t_sum)*1000:.2f}'})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
         # 1) Geocode first (to obtain lat/lon)
@@ -390,6 +571,19 @@ async def stream_plan(prompt: str):
                     yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'error', 'error': str(e)})}\n\n"
 
 
+    # Store/refresh session context for future refinements
+    if session_id:
+        SESSIONS[session_id] = {
+            "classification": context.get("classification"),
+            "weather": context.get("weather"),
+            "air": context.get("air"),
+            "holidays": context.get("holidays"),
+            "eta": context.get("eta"),
+            "itinerary_points": context.get("itinerary_points"),
+            "fx": context.get("fx"),
+            "geocode": context.get("geocode"),
+        }
+
     # Call Gemini (Summarizer & Final Plan)
     final_system = (
         "You are a trip-planning assistant. Produce a complete, user-friendly Markdown itinerary. "
@@ -429,7 +623,7 @@ async def stream_plan(prompt: str):
 
 @app.post("/plan-day")
 async def plan_day(req: PlanRequest):
-    return StreamingResponse(stream_plan(req.prompt), media_type="text/event-stream")
+    return StreamingResponse(stream_plan(req.prompt, req.session_id), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
