@@ -57,6 +57,78 @@ Services:
 - Orchestrator API on http://localhost:3002
 
 
+### Architecture
+
+```mermaid
+graph LR
+
+    U["Client CLI"]
+
+    O["Orchestrator (FastAPI /plan-day SSE)"]
+
+    G["Gemini API (LLM)"]
+
+    
+
+    subgraph MCP["MCP Tools (FastAPI)"]
+
+        GEO["geo"]
+
+        WEA["weather"]
+
+        AIR["air"]
+
+        RTE["route"]
+
+        CAL["calendar"]
+
+        FX["fx"]
+
+    end
+
+    
+
+    subgraph EXT["External APIs"]
+
+        NOM["Nominatim"]
+
+        OM["Open-Meteo"]
+
+        AQ["OpenAQ"]
+
+        OSRM["OSRM"]
+
+        NAGER["Nager.Date"]
+
+        FXAPI["exchangerate.host"]
+
+    end
+
+    
+
+    U -->|"POST /plan-day (SSE)"| O
+
+    O -->|"Classify / Plan / Summarize"| G
+
+    O -->|"HTTP JSON"| MCP
+
+    
+
+    GEO --> NOM
+
+    WEA --> OM
+
+    AIR --> AQ
+
+    AIR --> OM
+
+    RTE --> OSRM
+
+    CAL --> NAGER
+
+    FX --> FXAPI
+```
+
 ### CLI client
 Create a virtualenv and install the CLI dependencies with uv:
 ```bash
@@ -64,6 +136,25 @@ python3 -m venv .venv
 source .venv/bin/activate
 uv pip install -r client_cli/requirements.txt
 ```
+### How to start
+First, start the services (MCP Tools and Orchestrator) in Docker:
+```bash
+docker-compose up -d --build
+```
+
+Interactive mode (multi‑turn session with refinement/comparison and caching):
+```bash
+source .venv/bin/activate
+python3 client_cli/main.py -i
+# Then type prompts like:
+# Plan a museum-first day in Amsterdam on 2025-11-22. Bike preferred.
+# add a specialty coffee stop near the second venue
+# compare two options if it rains after 3 PM
+# convert 500000 Japanese Yen to Indian Rupee
+# EXPORT   # saves the last streamed itinerary to ./itinerary-YYYYmmdd-HHMMSS.md
+```
+
+You will see streaming tool traces in stderr and Markdown in stdout.
 
 Run the CLI with structured args (single turn):
 ```bash
@@ -81,20 +172,6 @@ Include a currency conversion in the prompt (orchestrator will call MCP FX):
 ```bash
 source .venv/bin/activate
 python3 client_cli/main.py --prompt "Plan a day in Tokyo on 2025-11-20. Also convert 200 USD to JPY"
-```
-
-You will see streaming tool traces in stderr and Markdown in stdout.
-
-Interactive mode (multi‑turn session with refinement/comparison and caching):
-```bash
-source .venv/bin/activate
-python3 client_cli/main.py -i
-# Then type prompts like:
-# Plan a museum-first day in Amsterdam on 2025-11-22. Bike preferred.
-# add a specialty coffee stop near the second venue
-# compare two options if it rains after 3 PM
-# convert 500000 Japanese Yen to Indian Rupee
-# EXPORT   # saves the last streamed itinerary to ./itinerary-YYYYmmdd-HHMMSS.md
 ```
 
 Notes:
