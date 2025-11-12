@@ -99,7 +99,7 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 MCP_TOOLS_URL = os.getenv("MCP_TOOLS_URL", "http://mcp-tools:3001")
 MCP_API_KEY = os.getenv("MCP_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-09-2025")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 CLASSIFICATION_DEFAULT_DATE = os.getenv("CLASSIFICATION_DEFAULT_DATE", "2025-11-10")
 ROUTE_PROFILE_DEFAULT = os.getenv("ROUTE_PROFILE_DEFAULT", "foot")
 NEARBY_RADIUS_M = int(os.getenv("NEARBY_RADIUS_M", "3000"))
