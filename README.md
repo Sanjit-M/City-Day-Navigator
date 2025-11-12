@@ -28,7 +28,7 @@ Optional overrides (default values shown):
 
 
 ### Make targets (optional)
-```makefile
+```Makefile
 start:
 	docker-compose up --build -d
 
