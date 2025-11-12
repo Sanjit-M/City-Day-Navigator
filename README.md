@@ -24,6 +24,7 @@ Optional overrides (default values shown):
 - NEARBY_RADIUS_M=3000
 - NEARBY_LIMIT=1
 - ROUTE_PROFILE_DEFAULT=foot
+ - ORCHESTRATOR_URL=http://localhost:3002 (for the CLI)
 
 
 ### Make targets (optional)
@@ -58,13 +59,13 @@ source .venv/bin/activate
 uv pip install -r client_cli/requirements.txt
 ```
 
-Run the CLI with structured args:
+Run the CLI with structured args (single turn):
 ```bash
 source .venv/bin/activate
 python3 client_cli/main.py "Kyoto" "2025-12-12" --prefer "temples" --prefer "walkable"
 ```
 
-Run the CLI with a free-form prompt:
+Run the CLI with a free-form prompt (single turn):
 ```bash
 source .venv/bin/activate
 python3 client_cli/main.py --prompt "Plan 10:00–18:00 in Kyoto on 2025-12-12. Prefer temples and walkable"
@@ -77,6 +78,22 @@ python3 client_cli/main.py --prompt "Plan a day in Tokyo on 2025-11-20. Also con
 ```
 
 You will see streaming tool traces in stderr and Markdown in stdout.
+
+Interactive mode (multi‑turn session with refinement/comparison and caching):
+```bash
+source .venv/bin/activate
+python3 client_cli/main.py -i
+# Then type prompts like:
+# Plan a museum-first day in Amsterdam on 2025-11-22. Bike preferred.
+# add a specialty coffee stop near the second venue
+# compare two options if it rains after 3 PM
+# convert 500000 Japanese Yen to Indian Rupee
+```
+
+Notes:
+- Interactive sessions automatically use a session_id so follow‑ups refine/compare the same plan.
+- Pure FX follow‑ups (e.g., “convert 200 USD to JPY”) short‑circuit planning and only return the conversion.
+- Determinism: for the same prompt/context, stop order and ETAs are stable (models at temperature 0, deterministic nearby sorting, and a plan/ETA cache).
 
 
 ### Quick health checks
@@ -138,6 +155,7 @@ All MCP endpoints require `X-API-KEY` header.
 - Nearby places (Nominatim search)
   - POST `http://localhost:3001/geo/nearby`
   - Body: `{ "lat": 35.0116, "lon": 135.7681, "query": "coffee", "radius_m": 3000, "limit": 3 }`
+  - Deterministic: results are ranked by distance from center then name for stable ordering.
 - Weather forecast (Open-Meteo)
   - POST `http://localhost:3001/weather/forecast`
   - Body: `{ "lat": 35.0116, "lon": 135.7681, "date": "2025-12-12" }`
@@ -157,11 +175,13 @@ All MCP endpoints require `X-API-KEY` header.
 
 Orchestrator (streams SSE):
 - POST `http://localhost:3002/plan-day`
-- Body: `{ "prompt": "Plan 10:00–18:00 in Kyoto on 2025-12-12. Prefer temples and walkable" }`
+- Body: `{ "prompt": "Plan 10:00–18:00 in Kyoto on 2025-12-12. Prefer temples and walkable", "session_id": "<optional UUID>" }`
 - Emits:
   - `tool_trace` entries for each tool call with durations
   - `plan_chunk` entries with Markdown segments
+  - a final “Tool trace summary” Markdown table with durations
   - `[DONE]` when complete
+- FX-only prompts (e.g., “convert 200 USD to JPY”) short‑circuit to only call MCP FX and return a compact Markdown table.
 
 
 ## 3) Notes on Gemini prompts for routing and summarization
@@ -179,7 +199,11 @@ Model must produce:
   "preferences": ["..."]
 }
 ```
-If classification is not `plan_day` but the prompt contains a currency conversion (e.g., “Convert 200 USD to JPY”), the orchestrator short-circuits to the FX tool and returns a small Markdown block with the rate and converted amount.
+If classification is not `plan_day` but the prompt contains a currency conversion (e.g., “Convert 200 USD to JPY”), the orchestrator short-circuits to the FX tool and returns a small Markdown block with the rate and converted amount. Currency phrases like “Japanese Yen” or “Indian Rupee” are normalized to ISO codes.
+
+Refinement and comparison:
+- `refine_plan`: re-plans venues based on the refinement instruction using prior session context (geocode/weather/air/holidays), recomputes nearby+ETA deterministically, and summarizes the refined itinerary.
+- `compare_options`: generates two alternative Markdown itineraries (“Option A” and “Option B”) using the existing session context without re-calling external tools.
 
 
 ### Venue planning prompt
@@ -187,6 +211,7 @@ Inputs to the planner include:
 - Weather summary, air-quality summary, holidays, preferences, basic geocoding
 Planner returns a JSON array of 4–6 venue names or types.
 The orchestrator then queries nearby places for each item and builds a point list for routing.
+Determinism: models are run with temperature 0, nearby results are ranked deterministically, and a per-context plan cache (city/date/country/preferences/coords/profile/radius/limit) ensures identical stop order and ETAs for repeated identical prompts.
 
 
 ### Routing and ETA
@@ -201,7 +226,7 @@ The final system instruction requires a Markdown itinerary and explicitly mandat
 4) Add a holiday caution when relevant  
 5) Include a “Currency Conversion” section when FX is present  
 
-For the final streaming output, the orchestrator uses a text-configured model instance to ensure Markdown text is returned (the classification model is configured for JSON).
+For the final streaming output, the orchestrator uses a text-configured model instance (temperature 0) to ensure stable Markdown text. Each response ends with a “Tool trace summary” table for visibility into which tools were called and their durations.
 
 
 ## Troubleshooting

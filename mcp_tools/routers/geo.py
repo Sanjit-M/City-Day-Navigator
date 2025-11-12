@@ -149,17 +149,39 @@ async def nearby(req: NearbyRequest) -> NearbyResponse:
             detail=f"Nominatim request failed: {str(e)}",
         )
 
-    results: List[NearbyItem] = []
+    # Deterministic ranking: distance from center, then name
+    def _dist2(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
+        # Approximate squared distance accounting for longitude shrink by latitude
+        import math
+        dlat = a_lat - b_lat
+        dlon = (a_lon - b_lon) * math.cos(math.radians((a_lat + b_lat) / 2.0))
+        return dlat * dlat + dlon * dlon
+
+    enriched: List[Dict[str, object]] = []
     for item in data:
+        try:
+            i_lat = float(item["lat"])
+            i_lon = float(item["lon"])
+        except (TypeError, ValueError, KeyError):
+            continue
         name = item.get("display_name") or item.get("name") or ""
-        tags = item.get("extratags") or {}
+        dist2 = _dist2(req.lat, req.lon, i_lat, i_lon)
+        enriched.append({"name": str(name), "lat": i_lat, "lon": i_lon, "tags": item.get("extratags") or {}, "dist2": dist2})
+
+    enriched.sort(key=lambda x: (x["dist2"], str(x["name"]).lower()))
+    # Trim to requested limit after sorting (in case API returned more)
+    enriched = enriched[: req.limit]
+
+    results: List[NearbyItem] = []
+    for e in enriched:
         # Ensure tags keys/values are strings
-        str_tags: Dict[str, str] = {str(k): str(v) for k, v in tags.items()}
+        raw_tags = e.get("tags") or {}
+        str_tags: Dict[str, str] = {str(k): str(v) for k, v in raw_tags.items()} if isinstance(raw_tags, dict) else {}
         results.append(
             NearbyItem(
-                name=name,
-                lat=float(item["lat"]),
-                lon=float(item["lon"]),
+                name=str(e["name"]),
+                lat=float(e["lat"]),
+                lon=float(e["lon"]),
                 tags=str_tags,
             )
         )

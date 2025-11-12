@@ -15,6 +15,8 @@ import uvicorn
 
 # In-memory session storage for interactive refinement
 SESSIONS: Dict[str, Dict[str, Any]] = {}
+# Deterministic plan cache (same normalized context -> same points and ETA)
+PLAN_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 CURRENCY_MAP = {
@@ -108,10 +110,22 @@ except ValueError:
     HTTP_TIMEOUT_SEC = 15.0
 model = genai.GenerativeModel(
     GEMINI_MODEL,
-    generation_config={"response_mime_type": "application/json"},
+    generation_config={
+        "response_mime_type": "application/json",
+        "temperature": 0.0,
+        "top_p": 1,
+        "top_k": 1,
+    },
 )
-# New model for text generation
-text_model = genai.GenerativeModel(GEMINI_MODEL)
+# New model for text generation (deterministic)
+text_model = genai.GenerativeModel(
+    GEMINI_MODEL,
+    generation_config={
+        "temperature": 0.0,
+        "top_p": 1,
+        "top_k": 1,
+    },
+)
 
 
 class PlanRequest(BaseModel):
@@ -519,41 +533,55 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
         tool_traces.append({'service': 'mcp-air', 'fn': 'aqi', 'duration_ms': a_ms})
         tool_traces.append({'service': 'mcp-calendar', 'fn': 'holidays', 'duration_ms': h_ms})
 
-        # Call Gemini (Planner) to propose venues
-        prefs = classification.get("preferences") or []
-        planning_context = {
-            "weather": context.get("weather"),
-            "air": context.get("air"),
-            "holidays": context.get("holidays"),
-            "preferences": prefs,
-            "city": classification.get("city"),
-            "date": classification.get("date"),
-            "country_code": classification.get("country_code"),
-        }
-        planner_prompt = (
-            "Given this context for planning a day itinerary, propose a JSON array of 4-6 venue names or venue types "
-            "(e.g., ['Kinkaku-ji Temple', 'Nishiki Market', 'Coffee shop']) that match user preferences and constraints. "
-            "Prefer indoor options if precipitation probability > 60%. Respond ONLY with a JSON array of strings.\n\n"
-            f"Context:\n{json.dumps(planning_context)}"
-        )
-        t_plan = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'pending'})}\n\n"
+        # Deterministic cache key and lookup
         try:
-            venues_response = await model.generate_content_async(planner_prompt)
-            venues_text = getattr(venues_response, "text", None) or ""
-            venue_list = json.loads(venues_text)
-            if not isinstance(venue_list, list):
-                raise ValueError("Planner did not return a list")
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'error', 'error': str(e)})}\n\n"
-            yield f"data: {json.dumps({'type': 'error', 'content': 'Planning failed.'})}\n\n"
-            return
-        pv_ms = (time.monotonic()-t_plan)*1000
-        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'complete', 'duration_ms': f'{pv_ms:.2f}', 'result': venue_list})}\n\n"
-        tool_traces.append({'service': 'gemini', 'fn': 'plan_venues', 'duration_ms': pv_ms})
+            lat_f = float(lat)
+            lon_f = float(lon)
+        except (TypeError, ValueError):
+            lat_f = lat
+            lon_f = lon
+        prefs_key = ",".join(sorted((classification.get("preferences") or [])))
+        cache_key = f"{classification.get('city') or ''}|{classification.get('date') or ''}|{classification.get('country_code') or ''}|{prefs_key}|{lat_f:.5f}|{lon_f:.5f}|{ROUTE_PROFILE_DEFAULT}|{NEARBY_RADIUS_M}|{NEARBY_LIMIT}"
+        cached = PLAN_CACHE.get(cache_key)
+        if cached:
+            context["itinerary_points"] = cached.get("itinerary_points") or []
+            context["eta"] = cached.get("eta")
+        # Call Gemini (Planner) to propose venues (only if not cached)
+        if not cached:
+            prefs = classification.get("preferences") or []
+            planning_context = {
+                "weather": context.get("weather"),
+                "air": context.get("air"),
+                "holidays": context.get("holidays"),
+                "preferences": prefs,
+                "city": classification.get("city"),
+                "date": classification.get("date"),
+                "country_code": classification.get("country_code"),
+            }
+            planner_prompt = (
+                "Given this context for planning a day itinerary, propose a JSON array of 4-6 venue names or venue types "
+                "(e.g., ['Kinkaku-ji Temple', 'Nishiki Market', 'Coffee shop']) that match user preferences and constraints. "
+                "Prefer indoor options if precipitation probability > 60%. Respond ONLY with a JSON array of strings.\n\n"
+                f"Context:\n{json.dumps(planning_context)}"
+            )
+            t_plan = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'pending'})}\n\n"
+            try:
+                venues_response = await model.generate_content_async(planner_prompt)
+                venues_text = getattr(venues_response, "text", None) or ""
+                venue_list = json.loads(venues_text)
+                if not isinstance(venue_list, list):
+                    raise ValueError("Planner did not return a list")
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'error', 'error': str(e)})}\n\n"
+                yield f"data: {json.dumps({'type': 'error', 'content': 'Planning failed.'})}\n\n"
+                return
+            pv_ms = (time.monotonic()-t_plan)*1000
+            yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'gemini', 'fn': 'plan_venues', 'status': 'complete', 'duration_ms': f'{pv_ms:.2f}', 'result': venue_list})}\n\n"
+            tool_traces.append({'service': 'gemini', 'fn': 'plan_venues', 'duration_ms': pv_ms})
 
         # Get Venue Details & ETAs
         itinerary_points: list[dict] = []
-        for venue in venue_list:
+        for venue in (venue_list if not cached else []):
             try:
                 query = str(venue)
                 nearby_req = {
@@ -580,7 +608,7 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                 continue
 
         # If we have at least 2 points, compute ETA across them
-        if len(itinerary_points) >= 2:
+        if not cached and len(itinerary_points) >= 2:
             try:
                 eta_req = {
                     "points": [{"lat": p["lat"], "lon": p["lon"]} for p in itinerary_points],
@@ -596,7 +624,10 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                 tool_traces.append({'service': 'mcp-route', 'fn': 'eta', 'duration_ms': eta_ms})
             except Exception as e:
                 yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-route', 'fn': 'eta', 'status': 'error', 'error': str(e)})}\n\n"
-        context["itinerary_points"] = itinerary_points
+        if not cached:
+            context["itinerary_points"] = itinerary_points
+            # Save to cache for deterministic reuse
+            PLAN_CACHE[cache_key] = {"itinerary_points": context["itinerary_points"], "eta": context.get("eta")}
 
         # Handle FX if requested in prompt
         lower_prompt = prompt.lower()

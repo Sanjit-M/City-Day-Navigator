@@ -21,9 +21,9 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "curl -sf -H 'X-API-KEY: ${MCP_API_KEY:-dev-key}' http://localhost:3001/ >/dev/null || exit 1"]
       interval: 2s
-      timeout: 5s
+      timeout: 3s
       retries: 15
-      start_period: 5s
+      start_period: 2s
   orchestrator:
     build:
       context: .
