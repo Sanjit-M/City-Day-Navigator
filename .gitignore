@@ -1,13 +1,54 @@
 # Python
 __pycache__/
-*.pyc
+.py[cod]
+*$py.class
+
+# Virtual environments
 .venv/
 venv/
 env/
-itinerary.md
 
-# Environment
+# Build and packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# Test/coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+junit*.xml
+
+# Environment files (do not commit secrets)
 .env
-*.env
+.env.*
+.envrc
+.python-version
+!.env.example
 
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# OS/editor
+.DS_Store
+.AppleDouble
+.idea/
+.vscode/
+.history/
 .cursor/
+
+# Optional local files
+docker-compose.override.yml
+
+# Project-specific (uncomment if you do NOT want to track it)
+# itinerary.md

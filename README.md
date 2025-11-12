@@ -239,6 +239,34 @@ For the final streaming output, the orchestrator uses a text-configured model in
 - 401/403 from OpenAQ  
   Ensure `OPENAQ_API_KEY` is valid in `.env` and visible in the container.
 
+## 4) Tests (acceptance)
+
+Minimal acceptance tests are included to validate core behaviors end‑to‑end via the orchestrator, without deep mocking.
+
+How to run:
+1) Start services:
+```bash
+docker-compose up -d --build
+```
+2) (Optional) Create/activate venv and install dev deps:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+```
+3) Run the test file:
+```bash
+pytest -v -rA tests/test_acceptance.py
+```
+
+What the tests do (brief summary):
+- Basic plan: checks that a Kyoto plan includes weather info, at least one ETA/travel leg, and multiple stops.
+- Rain fallback: on a known rainy test date, verifies an indoor‑heavy alternative is included.
+- Air guardrail: on a high‑PM2.5 test date, verifies “mask recommended” or an indoor swap is suggested.
+- Holiday awareness: on a holiday, verifies there’s a caution about closures/crowds.
+- FX only: verifies “Convert 200 USD to JPY” returns only a currency conversion (no itinerary).
+- Trace visibility: verifies a final “Tool trace summary” table is present listing tool calls and durations.
+
 
 ## Example prompts
 - “Plan a museum-first day in Amsterdam on 2025-11-22. Bike preferred.”  

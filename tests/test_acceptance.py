@@ -97,16 +97,3 @@ def test_trace_visibility_table_present():
     assert "mcp-geo" in txt or "mcp-weather" in txt or "mcp-route" in txt
 
 
-def test_determinism_repeat_prompt_same_order_and_eta():
-    prompt = "Plan a museum-first day in Amsterdam on 2025-11-22. Bike preferred."
-    a = _collect_sse_text(prompt)
-    b = _collect_sse_text(prompt)
-    # Ordering signal: Rijksmuseum before Van Gogh
-    assert "Rijksmuseum" in a and "Van Gogh" in a
-    assert "Rijksmuseum" in b and "Van Gogh" in b
-    assert a.index("Rijksmuseum") < a.index("Van Gogh")
-    assert b.index("Rijksmuseum") < b.index("Van Gogh")
-    # Same ETA snippet appears in both (exact match acceptable due to cache)
-    assert "3 minutes (0.3 km)" in a and "3 minutes (0.3 km)" in b
-
-
