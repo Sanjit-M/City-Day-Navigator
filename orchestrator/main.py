@@ -194,7 +194,7 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
     }
     context: dict = {"classification": classification}
 
-    # Handle standalone FX query BEFORE 'plan_day' check
+    # Prepare prompt-derived triggers
     lower_prompt = prompt.lower()
     fx_keywords = ["convert", "exchange", "fx", "rate"]
     currency_symbols_or_codes = [
@@ -204,18 +204,14 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
         "cny", "sek", "nzd", "mxn", "sgd", "hkd", "nok", "try", "rub", "brl", "zar",
     ]
     fx_triggered = any(kw in lower_prompt for kw in fx_keywords) or any(c in lower_prompt for c in currency_symbols_or_codes)
+    currency_pattern = r"([A-Za-z\s]{3,}|[\$€£¥₹₩฿₽₺]|A\$|C\$|NZ\$|Mex\$|S\$|HK\$|R\$|R|kr|CHF|CN¥)"
+    fx_match = re.search(r"(\d+(?:\.\d+)?)\s*" + currency_pattern + r"\s*(?:to|in|->|=)\s*" + currency_pattern, prompt, re.IGNORECASE)
 
-    if fx_triggered and classification.get('intent') != 'plan_day':
-        currency_pattern = r"([A-Za-z\s]{3,}|[\$€£¥₹₩฿₽₺]|A\$|C\$|NZ\$|Mex\$|S\$|HK\$|R\$|R|kr|CHF|CN¥)"
-        m = re.search(
-            r"(\d+(?:\.\d+)?)\s*" + currency_pattern + r"\s*(?:to|in|->|=)\s*" + currency_pattern,
-            prompt,
-            re.IGNORECASE,
-        )
-        if m:
+    if fx_triggered and classification.get('intent') != 'plan_day' and not any(k in lower_prompt for k in ["aqi","air quality","weather","forecast","holiday","holidays","public holiday","bank holiday"]):
+        if fx_match:
             try:
                 async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
-                    amount_str, from_str, to_str = m.group(1), m.group(2).strip(), m.group(3).strip()
+                    amount_str, from_str, to_str = fx_match.group(1), fx_match.group(2).strip(), fx_match.group(3).strip()
                     amount = float(amount_str)
                     from_ccy = normalize_currency(from_str)
                     to_ccy = normalize_currency(to_str)
@@ -252,6 +248,314 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                 yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'error', 'error': str(e)})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
+
+    # Handle standalone AQI / Weather / Holidays BEFORE 'plan_day' check
+    aqi_keywords = ["aqi", "air quality", "airquality", "pm2.5", "pm25", "pm10", "o3", "no2", "pollution"]
+    weather_keywords = ["weather", "forecast", "temperature", "rain", "precipitation", "wind", "snow", "sunny"]
+    holiday_keywords = ["holiday", "holidays", "public holiday", "bank holiday"]
+    aqi_triggered = any(kw in lower_prompt for kw in aqi_keywords)
+    weather_triggered = any(kw in lower_prompt for kw in weather_keywords)
+    holidays_triggered = any(kw in lower_prompt for kw in holiday_keywords)
+
+    # Combined short-circuit (supports any combination of FX/AQI/Weather/Holidays)
+    total_triggered = int(bool(fx_triggered)) + int(bool(aqi_triggered)) + int(bool(weather_triggered)) + int(bool(holidays_triggered))
+    if total_triggered >= 2 and classification.get('intent') != 'plan_day':
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
+                lat = lon = None
+                # Geocode if any component needs coordinates
+                if aqi_triggered or weather_triggered:
+                    t_geo = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'pending'})}\n\n"
+                    geo_req = {"city": classification.get("city"), "country_hint": classification.get("country_code")}
+                    geo_resp = await client.post(f"{MCP_TOOLS_URL}/geo/geocode", json=geo_req)
+                    geo_resp.raise_for_status()
+                    geocode_data = geo_resp.json()
+                    g_ms = (time.monotonic()-t_geo)*1000
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'complete', 'duration_ms': f'{g_ms:.2f}', 'result': geocode_data})}\n\n"
+                    tool_traces.append({'service': 'mcp-geo', 'fn': 'geocode', 'duration_ms': g_ms})
+                    lat = float(geocode_data.get("lat"))
+                    lon = float(geocode_data.get("lon"))
+
+                # Prepare tasks
+                tasks = []
+                # Weather
+                if weather_triggered:
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'pending'})}\n\n"
+                    async def call_weather_combined():
+                        t_w = time.monotonic()
+                        w_req = {"lat": lat, "lon": lon, "date": classification.get("date")}
+                        w_resp = await client.post(f"{MCP_TOOLS_URL}/weather/forecast", json=w_req)
+                        w_resp.raise_for_status()
+                        return w_resp.json(), (time.monotonic()-t_w)*1000
+                    tasks.append(("weather", call_weather_combined()))
+                # AQI
+                if aqi_triggered:
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'pending'})}\n\n"
+                    async def call_aqi_combined():
+                        t_a = time.monotonic()
+                        a_req = {"lat": lat, "lon": lon, "date": classification.get("date")}
+                        a_resp = await client.post(f"{MCP_TOOLS_URL}/air/aqi", json=a_req)
+                        a_resp.raise_for_status()
+                        return a_resp.json(), (time.monotonic()-t_a)*1000
+                    tasks.append(("aqi", call_aqi_combined()))
+                # Holidays
+                if holidays_triggered:
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'pending'})}\n\n"
+                    async def call_holidays_combined():
+                        t_h = time.monotonic()
+                        date_str = classification.get("date") or ""
+                        try:
+                            year = int((date_str or "1970-01-01").split("-")[0])
+                        except Exception:
+                            year = 1970
+                        h_req = {"country_code": classification.get("country_code"), "year": year}
+                        h_resp = await client.post(f"{MCP_TOOLS_URL}/calendar/holidays", json=h_req)
+                        h_resp.raise_for_status()
+                        return h_resp.json(), (time.monotonic()-t_h)*1000
+                    tasks.append(("holidays", call_holidays_combined()))
+                # FX
+                if fx_triggered and fx_match:
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'pending'})}\n\n"
+                    async def call_fx_combined():
+                        t_fx = time.monotonic()
+                        amount = float(fx_match.group(1))
+                        from_ccy = normalize_currency(fx_match.group(2).strip())
+                        to_ccy = normalize_currency(fx_match.group(3).strip())
+                        if not (from_ccy and to_ccy and len(from_ccy) == 3 and len(to_ccy) == 3):
+                            raise ValueError("Could not parse currencies for conversion")
+                        fx_body = {"amount": amount, "from": from_ccy, "to": to_ccy}
+                        fx_resp = await client.post(f"{MCP_TOOLS_URL}/fx/convert", json=fx_body)
+                        fx_resp.raise_for_status()
+                        data = fx_resp.json()
+                        data["_fx_ctx"] = {"amount": amount, "from": from_ccy, "to": to_ccy}
+                        return data, (time.monotonic()-t_fx)*1000
+                    tasks.append(("fx", call_fx_combined()))
+
+                # Execute selected tasks in parallel
+                # gather expects coroutines; we extract labels alongside results
+                labels = [label for label, _ in tasks]
+                coros = [coro for _, coro in tasks]
+                results = await asyncio.gather(*coros, return_exceptions=True)
+
+                # Emit completes and build sections
+                sections: list[str] = []
+                for label, res in zip(labels, results):
+                    if isinstance(res, Exception):
+                        # Emit error trace and continue
+                        if label == "weather":
+                            yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'error', 'error': str(res)})}\n\n"
+                        elif label == "aqi":
+                            yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'error', 'error': str(res)})}\n\n"
+                        else:
+                            yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'error', 'error': str(res)})}\n\n"
+                        continue
+                    data, dur_ms = res
+                    if label == "weather":
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'complete', 'duration_ms': f'{dur_ms:.2f}', 'result': data})}\n\n"
+                        tool_traces.append({'service': 'mcp-weather', 'fn': 'forecast', 'duration_ms': dur_ms})
+                        temp_c = data.get("temp_c", "N/A")
+                        precip = data.get("precip_prob", "N/A")
+                        wind = data.get("wind_kph", "N/A")
+                        summary_txt = data.get("summary", "")
+                        sections.append(
+                            "## Weather Forecast\n\n"
+                            "| Temp (°C) | Rain Prob (%) | Wind (kph) | Summary |\n"
+                            "| ---: | ---: | ---: | :--- |\n"
+                            f"| {temp_c} | {precip} | {wind} | {summary_txt} |\n"
+                        )
+                    elif label == "aqi":
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'complete', 'duration_ms': f'{dur_ms:.2f}', 'result': data})}\n\n"
+                        tool_traces.append({'service': 'mcp-air', 'fn': 'aqi', 'duration_ms': dur_ms})
+                        pm25 = data.get("pm25", "N/A")
+                        pm10 = data.get("pm10", "N/A")
+                        no2 = data.get("no2", "N/A")
+                        o3 = data.get("o3", "N/A")
+                        category = data.get("category", "N/A")
+                        sections.append(
+                            "## Air Quality\n\n"
+                            "| PM2.5 | PM10 | NO2 | O3 | Category |\n"
+                            "| ---: | ---: | ---: | ---: | :--- |\n"
+                            f"| {pm25} | {pm10} | {no2} | {o3} | **{category}** |\n"
+                        )
+                    elif label == "holidays":
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'complete', 'duration_ms': f'{dur_ms:.2f}', 'result': data})}\n\n"
+                        tool_traces.append({'service': 'mcp-calendar', 'fn': 'holidays', 'duration_ms': dur_ms})
+                        holidays_list = (data.get("holidays") or [])[:10]
+                        table = "## Public Holidays\n\n| Date | Holiday |\n| :--- | :--- |\n"
+                        for h in holidays_list:
+                            table += f"| {h.get('date', '')} | {h.get('localName', '')} |\n"
+                        if not holidays_list:
+                            table += "| N/A | N/A |\n"
+                        sections.append(table)
+                    else:  # fx
+                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'complete', 'duration_ms': f'{dur_ms:.2f}', 'result': data})}\n\n"
+                        tool_traces.append({'service': 'mcp-fx', 'fn': 'convert', 'duration_ms': dur_ms})
+                        ctx = data.get("_fx_ctx", {})
+                        rate = data.get("rate", "N/A")
+                        converted = data.get("converted", "N/A")
+                        amount = ctx.get("amount", "N/A")
+                        from_ccy = ctx.get("from", "N/A")
+                        to_ccy = ctx.get("to", "N/A")
+                        sections.append(
+                            "## Currency Conversion\n\n"
+                            "| From | To | Rate | Result |\n"
+                            "| :--- | :--- | :--- | :--- |\n"
+                            f"| {amount} {from_ccy} | {to_ccy} | {rate} | **{converted} {to_ccy}** |\n"
+                        )
+
+                # Stream sections
+                for sec in sections:
+                    yield f"data: {json.dumps({'type': 'plan_chunk', 'content': sec})}\n\n"
+
+                if tool_traces:
+                    summary_md = "### Tool trace summary\n\n| Service | Function | Duration (ms) |\n| :--- | :--- | ---: |\n"
+                    for tr in tool_traces:
+                        summary_md += f"| {tr['service']} | {tr['fn']} | {tr['duration_ms']:.2f} |\n"
+                    yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary_md})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': f'Combined query failed: {str(e)}'})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+    # Short-circuit AQI
+    if aqi_triggered and classification.get('intent') != 'plan_day':
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
+                # Geocode to get coordinates
+                t_geo = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'pending'})}\n\n"
+                geo_req = {"city": classification.get("city"), "country_hint": classification.get("country_code")}
+                geo_resp = await client.post(f"{MCP_TOOLS_URL}/geo/geocode", json=geo_req)
+                geo_resp.raise_for_status()
+                geocode_data = geo_resp.json()
+                g_ms = (time.monotonic()-t_geo)*1000
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'complete', 'duration_ms': f'{g_ms:.2f}', 'result': geocode_data})}\n\n"
+                tool_traces.append({'service': 'mcp-geo', 'fn': 'geocode', 'duration_ms': g_ms})
+
+                lat = float(geocode_data.get("lat"))
+                lon = float(geocode_data.get("lon"))
+                a_req = {"lat": lat, "lon": lon, "date": classification.get("date")}
+                t_air = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'pending'})}\n\n"
+                aqi_resp = await client.post(f"{MCP_TOOLS_URL}/air/aqi", json=a_req)
+                aqi_resp.raise_for_status()
+                aqi_data = aqi_resp.json()
+                a_ms = (time.monotonic()-t_air)*1000
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'complete', 'duration_ms': f'{a_ms:.2f}', 'result': aqi_data})}\n\n"
+                tool_traces.append({'service': 'mcp-air', 'fn': 'aqi', 'duration_ms': a_ms})
+
+                pm25 = aqi_data.get("pm25", "N/A")
+                pm10 = aqi_data.get("pm10", "N/A")
+                no2 = aqi_data.get("no2", "N/A")
+                o3 = aqi_data.get("o3", "N/A")
+                category = aqi_data.get("category", "N/A")
+                summary = (
+                    "## Air Quality\n\n"
+                    "| PM2.5 | PM10 | NO2 | O3 | Category |\n"
+                    "| ---: | ---: | ---: | ---: | :--- |\n"
+                    f"| {pm25} | {pm10} | {no2} | {o3} | **{category}** |\n"
+                )
+                yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary})}\n\n"
+
+                if tool_traces:
+                    summary_md = "### Tool trace summary\n\n| Service | Function | Duration (ms) |\n| :--- | :--- | ---: |\n"
+                    for tr in tool_traces:
+                        summary_md += f"| {tr['service']} | {tr['fn']} | {tr['duration_ms']:.2f} |\n"
+                    yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary_md})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-air', 'fn': 'aqi', 'status': 'error', 'error': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+    # Short-circuit Weather
+    if weather_triggered and classification.get('intent') != 'plan_day':
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
+                # Geocode to get coordinates
+                t_geo = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'pending'})}\n\n"
+                geo_req = {"city": classification.get("city"), "country_hint": classification.get("country_code")}
+                geo_resp = await client.post(f"{MCP_TOOLS_URL}/geo/geocode", json=geo_req)
+                geo_resp.raise_for_status()
+                geocode_data = geo_resp.json()
+                g_ms = (time.monotonic()-t_geo)*1000
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-geo', 'fn': 'geocode', 'status': 'complete', 'duration_ms': f'{g_ms:.2f}', 'result': geocode_data})}\n\n"
+                tool_traces.append({'service': 'mcp-geo', 'fn': 'geocode', 'duration_ms': g_ms})
+
+                lat = float(geocode_data.get("lat"))
+                lon = float(geocode_data.get("lon"))
+                w_req = {"lat": lat, "lon": lon, "date": classification.get("date")}
+                t_w = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'pending'})}\n\n"
+                w_resp = await client.post(f"{MCP_TOOLS_URL}/weather/forecast", json=w_req)
+                w_resp.raise_for_status()
+                weather_data = w_resp.json()
+                w_ms = (time.monotonic()-t_w)*1000
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'complete', 'duration_ms': f'{w_ms:.2f}', 'result': weather_data})}\n\n"
+                tool_traces.append({'service': 'mcp-weather', 'fn': 'forecast', 'duration_ms': w_ms})
+
+                temp_c = weather_data.get("temp_c", "N/A")
+                precip = weather_data.get("precip_prob", "N/A")
+                wind = weather_data.get("wind_kph", "N/A")
+                summary_txt = weather_data.get("summary", "")
+                summary = (
+                    "## Weather Forecast\n\n"
+                    "| Temp (°C) | Rain Prob (%) | Wind (kph) | Summary |\n"
+                    "| ---: | ---: | ---: | :--- |\n"
+                    f"| {temp_c} | {precip} | {wind} | {summary_txt} |\n"
+                )
+                yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary})}\n\n"
+
+                if tool_traces:
+                    summary_md = "### Tool trace summary\n\n| Service | Function | Duration (ms) |\n| :--- | :--- | ---: |\n"
+                    for tr in tool_traces:
+                        summary_md += f"| {tr['service']} | {tr['fn']} | {tr['duration_ms']:.2f} |\n"
+                    yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary_md})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-weather', 'fn': 'forecast', 'status': 'error', 'error': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+    # Short-circuit Holidays
+    if holidays_triggered and classification.get('intent') != 'plan_day':
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
+                # Call holidays directly (no geocode needed)
+                date_str = classification.get("date") or ""
+                try:
+                    year = int((date_str or "1970-01-01").split("-")[0])
+                except Exception:
+                    year = 1970
+                h_req = {"country_code": classification.get("country_code"), "year": year}
+                t_h = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'pending'})}\n\n"
+                h_resp = await client.post(f"{MCP_TOOLS_URL}/calendar/holidays", json=h_req)
+                h_resp.raise_for_status()
+                holidays_data = h_resp.json() or {}
+                h_ms = (time.monotonic()-t_h)*1000
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'complete', 'duration_ms': f'{h_ms:.2f}', 'result': holidays_data})}\n\n"
+                tool_traces.append({'service': 'mcp-calendar', 'fn': 'holidays', 'duration_ms': h_ms})
+
+                holidays_list = (holidays_data.get("holidays") or [])[:10]
+                table = "## Public Holidays\n\n| Date | Holiday |\n| :--- | :--- |\n"
+                for h in holidays_list:
+                    table += f"| {h.get('date', '')} | {h.get('localName', '')} |\n"
+                if not holidays_list:
+                    table += "| N/A | N/A |\n"
+                yield f"data: {json.dumps({'type': 'plan_chunk', 'content': table})}\n\n"
+
+                if tool_traces:
+                    summary_md = "### Tool trace summary\n\n| Service | Function | Duration (ms) |\n| :--- | :--- | ---: |\n"
+                    for tr in tool_traces:
+                        summary_md += f"| {tr['service']} | {tr['fn']} | {tr['duration_ms']:.2f} |\n"
+                    yield f"data: {json.dumps({'type': 'plan_chunk', 'content': summary_md})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-calendar', 'fn': 'holidays', 'status': 'error', 'error': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
     # Handle non-plan intents with session support
     intent = classification.get('intent')
@@ -355,12 +659,6 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
                     tool_traces.append({'service': 'gemini', 'fn': 'plan_venues_refine', 'duration_ms': pv_r_ms})
 
                     # Nearby + ETA based on refined venues
-                    headers = {
-                        "X-API-KEY": MCP_API_KEY or "",
-                        "Content-Type": "application/json",
-                        "Accept": "application/json",
-                        "User-Agent": "CityDayNavigator-Orchestrator",
-                    }
                     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
                         itinerary_points: list[dict] = []
                         for venue in venue_list:
@@ -629,43 +927,26 @@ async def stream_plan(prompt: str, session_id: Optional[str]):
             # Save to cache for deterministic reuse
             PLAN_CACHE[cache_key] = {"itinerary_points": context["itinerary_points"], "eta": context.get("eta")}
 
-        # Handle FX if requested in prompt
-        lower_prompt = prompt.lower()
-        fx_keywords = ["convert", "exchange", "fx", "rate"]
-        currency_symbols_or_codes = [
-            "$", "€", "£", "¥", "₹", "₩", "฿", "A$", "C$", "CHF", "CN¥", "kr", "NZ$",
-            "Mex$", "S$", "HK$", "₺", "₽", "R$", "R",
-            "usd", "eur", "gbp", "jpy", "inr", "krw", "thb", "aud", "cad", "chf",
-            "cny", "sek", "nzd", "mxn", "sgd", "hkd", "nok", "try", "rub", "brl", "zar",
-        ]
-        fx_triggered = any(kw in lower_prompt for kw in fx_keywords) or any(c in lower_prompt for c in currency_symbols_or_codes)
-        if fx_triggered:
-            # More robust currency pattern
-            currency_pattern = r"([A-Za-z\s]{3,}|[\$€£¥₹₩฿₽₺]|A\$|C\$|NZ\$|Mex\$|S\$|HK\$|R\$|R|kr|CHF|CN¥)"
-            m = re.search(
-                r"(\d+(?:\.\d+)?)\s*" + currency_pattern + r"\s*(?:to|in|->|=)\s*" + currency_pattern,
-                prompt,
-                re.IGNORECASE,
-            )
-            if m:
-                try:
-                    amount_str, from_str, to_str = m.group(1), m.group(2).strip(), m.group(3).strip()
-                    amount = float(amount_str)
-                    from_ccy = normalize_currency(from_str)
-                    to_ccy = normalize_currency(to_str)
+        # Handle FX if requested in prompt (single-plan flow only; combined handled earlier)
+        if fx_triggered and fx_match:
+            try:
+                amount_str, from_str, to_str = fx_match.group(1), fx_match.group(2).strip(), fx_match.group(3).strip()
+                amount = float(amount_str)
+                from_ccy = normalize_currency(from_str)
+                to_ccy = normalize_currency(to_str)
 
-                    if len(from_ccy) == 3 and len(to_ccy) == 3:
-                        t_fx = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'pending'})}\n\n"
-                        fx_body = {"amount": amount, "from": from_ccy, "to": to_ccy}
-                        fx_resp = await client.post(f"{MCP_TOOLS_URL}/fx/convert", json=fx_body)
-                        fx_resp.raise_for_status()
-                        fx_data = fx_resp.json()
-                        context["fx"] = fx_data
-                        fx_ms = (time.monotonic()-t_fx)*1000
-                        yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'complete', 'duration_ms': f'{fx_ms:.2f}', 'result': fx_data})}\n\n"
-                        tool_traces.append({'service': 'mcp-fx', 'fn': 'convert', 'duration_ms': fx_ms})
-                except Exception as e:
-                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'error', 'error': str(e)})}\n\n"
+                if len(from_ccy) == 3 and len(to_ccy) == 3:
+                    t_fx = time.monotonic(); yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'pending'})}\n\n"
+                    fx_body = {"amount": amount, "from": from_ccy, "to": to_ccy}
+                    fx_resp = await client.post(f"{MCP_TOOLS_URL}/fx/convert", json=fx_body)
+                    fx_resp.raise_for_status()
+                    fx_data = fx_resp.json()
+                    context["fx"] = fx_data
+                    fx_ms = (time.monotonic()-t_fx)*1000
+                    yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'complete', 'duration_ms': f'{fx_ms:.2f}', 'result': fx_data})}\n\n"
+                    tool_traces.append({'service': 'mcp-fx', 'fn': 'convert', 'duration_ms': fx_ms})
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'tool_trace', 'service': 'mcp-fx', 'fn': 'convert', 'status': 'error', 'error': str(e)})}\n\n"
 
 
     # Store/refresh session context for future refinements

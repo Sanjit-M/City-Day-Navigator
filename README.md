@@ -151,7 +151,7 @@ python3 client_cli/main.py -i
 # add a specialty coffee stop near the second venue
 # compare two options if it rains after 3 PM
 # convert 500000 Japanese Yen to Indian Rupee
-# EXPORT   # saves the last streamed itinerary to ./itinerary-YYYYmmdd-HHMMSS.md
+# EXPORT   # saves the entire session's streamed output (all turns) to ./itinerary-YYYYmmdd-HHMMSS.md
 ```
 
 You will see streaming tool traces in stderr and Markdown in stdout.
@@ -178,6 +178,8 @@ Notes:
 - EXPORT is available only in interactive mode and saves to the current working directory.
 - Interactive sessions automatically use a session_id so follow‑ups refine/compare the same plan.
 - Pure FX follow‑ups (e.g., “convert 200 USD to JPY”) short‑circuit planning and only return the conversion.
+- Pure AQI/weather/holiday follow‑ups (e.g., “What’s the AQI in Kyoto?”, “Weather in Kyoto on 2025‑12‑12”, “Public holidays in JP this year”) also short‑circuit and return compact tables without generating an itinerary.
+- You can combine these (e.g., “AQI in Kyoto and public holidays in JP this year?”); the orchestrator will return multiple compact sections in one response, still without generating an itinerary.
 - Determinism: for the same prompt/context, stop order and ETAs are stable (models at temperature 0, deterministic nearby sorting, and a plan/ETA cache).
 
 
@@ -266,7 +268,12 @@ Orchestrator (streams SSE):
   - `plan_chunk` entries with Markdown segments
   - a final “Tool trace summary” Markdown table with durations
   - `[DONE]` when complete
-- FX-only prompts (e.g., “convert 200 USD to JPY”) short‑circuit to only call MCP FX and return a compact Markdown table.
+- Short‑circuit prompts:
+  - FX-only (e.g., “convert 200 USD to JPY”) → compact FX table
+  - AQI-only (e.g., “AQI in Kyoto on 2025‑12‑12?”) → compact AQI table
+  - Weather-only (e.g., “Weather in Kyoto on 2025‑12‑12?”) → compact weather table
+  - Holidays-only (e.g., “Public holidays in JP in 2025?”) → compact holidays table
+  - Combos of any of the above (e.g., “AQI in Kyoto and convert 200 USD to JPY”) → multiple compact sections, no itinerary
 
 
 ## 3) Notes on Gemini prompts for routing and summarization
