@@ -17,6 +17,12 @@ Plan a compact, weather-aware day itinerary for any city. The system:
   - EXCHANGERATE_API_KEY=...
   - OPENAQ_API_KEY=...
 
+Create your `.env` from the example and fill in keys:
+```bash
+cp .env.example .env
+# edit .env with your keys
+```
+
 Optional overrides (default values shown):
 - GEMINI_MODEL=gemini-2.5-flash-preview-09-2025
 - CLASSIFICATION_DEFAULT_DATE=2025-11-10
@@ -92,6 +98,7 @@ python3 client_cli/main.py -i
 ```
 
 Notes:
+- EXPORT is available only in interactive mode and saves to the current working directory.
 - Interactive sessions automatically use a session_id so follow‑ups refine/compare the same plan.
 - Pure FX follow‑ups (e.g., “convert 200 USD to JPY”) short‑circuit planning and only return the conversion.
 - Determinism: for the same prompt/context, stop order and ETAs are stable (models at temperature 0, deterministic nearby sorting, and a plan/ETA cache).

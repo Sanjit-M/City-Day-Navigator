@@ -15,8 +15,8 @@ services:
       - MCP_RATE_LIMIT=${MCP_RATE_LIMIT:-30/minute}
       - MCP_USER_AGENT=${MCP_USER_AGENT:-CityDayNavigator-MCP-Tool}
       - HTTP_TIMEOUT_SEC=${HTTP_TIMEOUT_SEC:-10}
-      - EXCHANGERATE_API_KEY=${EXCHANGERATE_API_KEY:-your_api_key_here}
-      - OPENAQ_API_KEY=${OPENAQ_API_KEY:-your_api_key_here}
+      - EXCHANGERATE_API_KEY=${EXCHANGERATE_API_KEY}
+      - OPENAQ_API_KEY=${OPENAQ_API_KEY}
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -sf -H 'X-API-KEY: ${MCP_API_KEY:-dev-key}' http://localhost:3001/ >/dev/null || exit 1"]
