@@ -8,7 +8,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from ..deps import get_api_key
+from ..deps import get_api_key, get_http_client
 from ..config import CONFIG
 
 
@@ -28,11 +28,10 @@ class ETARequest(BaseModel):
 class ETAResponse(BaseModel):
     distance_km: float
     duration_min: float
-    polyline: Optional[str] = None
 
 
 @router.post("/eta", response_model=ETAResponse)
-async def eta(req: ETARequest) -> ETAResponse:
+async def eta(req: ETARequest, client: httpx.AsyncClient = Depends(get_http_client)) -> ETAResponse:
     start_time = time.monotonic()
     if not req.points or len(req.points) < 2:
         raise HTTPException(
@@ -43,20 +42,19 @@ async def eta(req: ETARequest) -> ETAResponse:
     coords = ";".join(f"{p.lon},{p.lat}" for p in req.points)
     url = f"{CONFIG.osrm_base}/route/v1/{req.profile}/{coords}"
     params = {
-        "overview": "simplified",
-        "geometries": "polyline",
+        # No geometry to minimize payload size
+        "overview": "false",
     }
     headers = {"User-Agent": CONFIG.user_agent}
 
     try:
-        async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
-            resp = await client.get(url, params=params, headers=headers)
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"OSRM error: {resp.status_code}",
-                )
-            data = resp.json()
+        resp = await client.get(url, params=params, headers=headers)
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"OSRM error: {resp.status_code}",
+            )
+        data = resp.json()
     except httpx.HTTPError as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -74,7 +72,6 @@ async def eta(req: ETARequest) -> ETAResponse:
     try:
         distance_km = float(route0.get("distance", 0.0)) / 1000.0
         duration_min = float(route0.get("duration", 0.0)) / 60.0
-        polyline = route0.get("geometry")
     except (TypeError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -93,5 +90,5 @@ async def eta(req: ETARequest) -> ETAResponse:
         "http_status": http_status,
     }
     logging.info(json.dumps(log_data))
-    return ETAResponse(distance_km=distance_km, duration_min=duration_min, polyline=polyline)
+    return ETAResponse(distance_km=distance_km, duration_min=duration_min)
 

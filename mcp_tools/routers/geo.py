@@ -8,7 +8,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from ..deps import get_api_key
+from ..deps import get_api_key, get_http_client
 from ..config import CONFIG
 
 
@@ -23,11 +23,10 @@ class GeocodeRequest(BaseModel):
 class GeocodeResponse(BaseModel):
     lat: float
     lon: float
-    display_name: str
 
 
 @router.post("/geocode", response_model=GeocodeResponse)
-async def geocode(req: GeocodeRequest) -> GeocodeResponse:
+async def geocode(req: GeocodeRequest, client: httpx.AsyncClient = Depends(get_http_client)) -> GeocodeResponse:
     start_time = time.monotonic()
     query = req.city if not req.country_hint else f"{req.city}, {req.country_hint}"
     params = {
@@ -38,21 +37,20 @@ async def geocode(req: GeocodeRequest) -> GeocodeResponse:
     }
     headers = {"User-Agent": CONFIG.user_agent}
     try:
-        async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
-            resp = await client.get(
-                f"{CONFIG.nominatim_base}/search",
-                params=params,
-                headers=headers,
+        resp = await client.get(
+            f"{CONFIG.nominatim_base}/search",
+            params=params,
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Nominatim error: {resp.status_code}",
             )
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Nominatim error: {resp.status_code}",
-                )
-            data = resp.json()
-            latency_ms = (time.monotonic() - start_time) * 1000
-            http_status = resp.status_code
-            ok = True
+        data = resp.json()
+        latency_ms = (time.monotonic() - start_time) * 1000
+        http_status = resp.status_code
+        ok = True
     except httpx.HTTPError as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -75,7 +73,6 @@ async def geocode(req: GeocodeRequest) -> GeocodeResponse:
     return GeocodeResponse(
         lat=float(first["lat"]),
         lon=float(first["lon"]),
-        display_name=first.get("display_name", ""),
     )
 
 
@@ -91,7 +88,6 @@ class NearbyItem(BaseModel):
     name: str
     lat: float
     lon: float
-    tags: Dict[str, str] = {}
 
 
 class NearbyResponse(BaseModel):
@@ -114,7 +110,7 @@ def _bbox_from_center(lat: float, lon: float, radius_m: int) -> str:
 
 
 @router.post("/nearby", response_model=NearbyResponse)
-async def nearby(req: NearbyRequest) -> NearbyResponse:
+async def nearby(req: NearbyRequest, client: httpx.AsyncClient = Depends(get_http_client)) -> NearbyResponse:
     start_time = time.monotonic()
     viewbox = _bbox_from_center(req.lat, req.lon, req.radius_m)
     params = {
@@ -124,25 +120,23 @@ async def nearby(req: NearbyRequest) -> NearbyResponse:
         "addressdetails": 0,
         "viewbox": viewbox,
         "bounded": 1,
-        "extratags": 1,
     }
     headers = {"User-Agent": CONFIG.user_agent}
     try:
-        async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
-            resp = await client.get(
-                f"{CONFIG.nominatim_base}/search",
-                params=params,
-                headers=headers,
+        resp = await client.get(
+            f"{CONFIG.nominatim_base}/search",
+            params=params,
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Nominatim error: {resp.status_code}",
             )
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Nominatim error: {resp.status_code}",
-                )
-            data = resp.json()
-            latency_ms = (time.monotonic() - start_time) * 1000
-            http_status = resp.status_code
-            ok = True
+        data = resp.json()
+        latency_ms = (time.monotonic() - start_time) * 1000
+        http_status = resp.status_code
+        ok = True
     except httpx.HTTPError as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -166,7 +160,7 @@ async def nearby(req: NearbyRequest) -> NearbyResponse:
             continue
         name = item.get("display_name") or item.get("name") or ""
         dist2 = _dist2(req.lat, req.lon, i_lat, i_lon)
-        enriched.append({"name": str(name), "lat": i_lat, "lon": i_lon, "tags": item.get("extratags") or {}, "dist2": dist2})
+        enriched.append({"name": str(name), "lat": i_lat, "lon": i_lon, "dist2": dist2})
 
     enriched.sort(key=lambda x: (x["dist2"], str(x["name"]).lower()))
     # Trim to requested limit after sorting (in case API returned more)
@@ -174,15 +168,11 @@ async def nearby(req: NearbyRequest) -> NearbyResponse:
 
     results: List[NearbyItem] = []
     for e in enriched:
-        # Ensure tags keys/values are strings
-        raw_tags = e.get("tags") or {}
-        str_tags: Dict[str, str] = {str(k): str(v) for k, v in raw_tags.items()} if isinstance(raw_tags, dict) else {}
         results.append(
             NearbyItem(
                 name=str(e["name"]),
                 lat=float(e["lat"]),
                 lon=float(e["lon"]),
-                tags=str_tags,
             )
         )
     log_data = {

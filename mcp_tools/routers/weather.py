@@ -8,7 +8,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from ..deps import get_api_key
+from ..deps import get_api_key, get_http_client
 from ..config import CONFIG
 
 
@@ -29,7 +29,7 @@ class ForecastResponse(BaseModel):
 
 
 @router.post("/forecast", response_model=ForecastResponse)
-async def forecast(req: ForecastRequest) -> ForecastResponse:
+async def forecast(req: ForecastRequest, client: httpx.AsyncClient = Depends(get_http_client)) -> ForecastResponse:
     # --- Test hook for rain fallback ---
     if req.date == "1999-12-31":
         return ForecastResponse(
@@ -51,30 +51,29 @@ async def forecast(req: ForecastRequest) -> ForecastResponse:
     headers = {"User-Agent": CONFIG.user_agent}
 
     try:
-        async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
-            resp = await client.get(CONFIG.open_meteo_base, params=params, headers=headers)
-            if resp.status_code != 200:
-                # Fallback: fetch nearest-available (no explicit date window)
-                fb_params = {
-                    "latitude": req.lat,
-                    "longitude": req.lon,
-                    "hourly": "temperature_2m,precipitation_probability,windspeed_10m",
-                    "timezone": "UTC",
-                }
-                resp_fb = await client.get(CONFIG.open_meteo_base, params=fb_params, headers=headers)
-                if resp_fb.status_code != 200:
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail=f"Open-Meteo error: {resp.status_code}",
-                    )
-                data = resp_fb.json()
-                fallback_used = True
-            else:
-                data = resp.json()
-                fallback_used = False
-            latency_ms = (time.monotonic() - start_time) * 1000
-            http_status = resp.status_code
-            ok = True
+        resp = await client.get(CONFIG.open_meteo_base, params=params, headers=headers)
+        if resp.status_code != 200:
+            # Fallback: fetch nearest-available (no explicit date window)
+            fb_params = {
+                "latitude": req.lat,
+                "longitude": req.lon,
+                "hourly": "temperature_2m,precipitation_probability,windspeed_10m",
+                "timezone": "UTC",
+            }
+            resp_fb = await client.get(CONFIG.open_meteo_base, params=fb_params, headers=headers)
+            if resp_fb.status_code != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Open-Meteo error: {resp.status_code}",
+                )
+            data = resp_fb.json()
+            fallback_used = True
+        else:
+            data = resp.json()
+            fallback_used = False
+        latency_ms = (time.monotonic() - start_time) * 1000
+        http_status = resp.status_code
+        ok = True
     except httpx.HTTPError as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

@@ -2,6 +2,9 @@ import os
 import logging
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.middleware.gzip import GZipMiddleware
+from contextlib import asynccontextmanager
+import httpx
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -29,10 +32,20 @@ logging.basicConfig(
 
 limiter = Limiter(key_func=get_remote_address, default_limits=[CONFIG.rate_limit])
 
-app = FastAPI(title="MCP Tools")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    http_client = httpx.AsyncClient(timeout=CONFIG.http_timeout_sec)
+    app.state.http_client = http_client
+    try:
+        yield
+    finally:
+        await http_client.aclose()
+
+app = FastAPI(title="MCP Tools", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=512)
 app.include_router(geo_router, prefix="/geo")
 app.include_router(weather_router, prefix="/weather")
 app.include_router(air_router, prefix="/air")

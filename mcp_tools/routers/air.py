@@ -9,7 +9,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from ..deps import get_api_key
+from ..deps import get_api_key, get_http_client
 from ..config import CONFIG
 
 OPEN_METEO_AIR_BASE = "https://air-quality-api.open-meteo.com/v1/air-quality"
@@ -34,8 +34,8 @@ class AQIResponse(BaseModel):
     category: str
 
 
-@router.post("/aqi", response_model=AQIResponse)
-async def aqi(req: AQIRequest) -> AQIResponse:
+@router.post("/aqi", response_model=AQIResponse, response_model_exclude_none=True)
+async def aqi(req: AQIRequest, client: httpx.AsyncClient = Depends(get_http_client)) -> AQIResponse:
     # Test hook to force high AQI path
     if req.date == "1999-12-30":
         return AQIResponse(pm25=80.0, pm10=120.0, no2=40.0, o3=30.0, category="Unhealthy")
@@ -175,57 +175,54 @@ async def aqi(req: AQIRequest) -> AQIResponse:
     http_status = 200
 
     try:
-        async with httpx.AsyncClient(timeout=CONFIG.http_timeout_sec) as client:
-            # 1) Try /latest near coordinates with widening radius
-            for r_m in (10000, 25000, 50000, 100000):
-                value_by_param = await openaq_latest_nearby(client, req.lat, req.lon, r_m)
-                if value_by_param:
-                    break
+        # 1) Try /latest near coordinates with widening radius
+        for r_m in (10000, 25000, 50000, 100000):
+            value_by_param = await openaq_latest_nearby(client, req.lat, req.lon, r_m)
+            if value_by_param:
+                break
 
-            # 2) If still empty, find nearest location and pull measurements (date-bound then latest)
-            if not value_by_param:
-                loc_id = await openaq_find_nearest_location(client, req.lat, req.lon, 100000)
-                if loc_id:
-                    if use_date:
-                        value_by_param = await openaq_measurements_for_location(client, loc_id, use_date)
-                    if not value_by_param:
-                        value_by_param = await openaq_measurements_for_location(client, loc_id, None)
-
-            # 3) Last-resort fallback: Open‑Meteo Air Quality
-            if not value_by_param:
-                om_params = {
-                    "latitude": req.lat,
-                    "longitude": req.lon,
-                    "hourly": "pm2_5,pm10,ozone,nitrogen_dioxide",
-                    "timezone": "UTC",
-                }
+        # 2) If still empty, find nearest location and pull measurements (date-bound then latest)
+        if not value_by_param:
+            loc_id = await openaq_find_nearest_location(client, req.lat, req.lon, 100000)
+            if loc_id:
                 if use_date:
-                    om_params["past_days"] = 1
-                    om_params["forecast_days"] = 1
-                r_om = await client.get(OPEN_METEO_AIR_BASE, params=om_params, headers={"User-Agent": CONFIG.user_agent})
-                if r_om.status_code == 200:
-                    d = r_om.json() or {}
-                    hourly = d.get("hourly") or {}
-                    times = hourly.get("time") or []
-                    pm25_arr = hourly.get("pm2_5") or []
-                    pm10_arr = hourly.get("pm10") or []
-                    o3_arr = hourly.get("ozone") or []
-                    no2_arr = hourly.get("nitrogen_dioxide") or []
-                    # pick middle/closest hour (best-effort)
-                    idx = len(times) // 2 if times else 0
-                    if times:
-                        try:
-                            # Try align to current UTC hour index if present
-                            now_hour = datetime.utcnow().strftime("%Y-%m-%dT%H:00")
-                            if now_hour in times:
-                                idx = times.index(now_hour)
-                        except Exception:
-                            pass
-                    if idx < len(pm25_arr): value_by_param["pm25"] = float(pm25_arr[idx])
-                    if idx < len(pm10_arr): value_by_param["pm10"] = float(pm10_arr[idx])
-                    if idx < len(o3_arr): value_by_param["o3"] = float(o3_arr[idx])
-                    if idx < len(no2_arr): value_by_param["no2"] = float(no2_arr[idx])
-                    # do not set http_status here; we only report 404 if completely empty
+                    value_by_param = await openaq_measurements_for_location(client, loc_id, use_date)
+                if not value_by_param:
+                    value_by_param = await openaq_measurements_for_location(client, loc_id, None)
+
+        # 3) Last-resort fallback: Open‑Meteo Air Quality
+        if not value_by_param:
+            om_params = {
+                "latitude": req.lat,
+                "longitude": req.lon,
+                "hourly": "pm2_5,pm10,ozone,nitrogen_dioxide",
+                "timezone": "UTC",
+            }
+            if use_date:
+                om_params["past_days"] = 1
+                om_params["forecast_days"] = 1
+            r_om = await client.get(OPEN_METEO_AIR_BASE, params=om_params, headers={"User-Agent": CONFIG.user_agent})
+            if r_om.status_code == 200:
+                d = r_om.json() or {}
+                hourly = d.get("hourly") or {}
+                times = hourly.get("time") or []
+                pm25_arr = hourly.get("pm2_5") or []
+                pm10_arr = hourly.get("pm10") or []
+                o3_arr = hourly.get("ozone") or []
+                no2_arr = hourly.get("nitrogen_dioxide") or []
+                idx = len(times) // 2 if times else 0
+                if times:
+                    try:
+                        now_hour = datetime.utcnow().strftime("%Y-%m-%dT%H:00")
+                        if now_hour in times:
+                            idx = times.index(now_hour)
+                    except Exception:
+                        pass
+                if idx < len(pm25_arr): value_by_param["pm25"] = float(pm25_arr[idx])
+                if idx < len(pm10_arr): value_by_param["pm10"] = float(pm10_arr[idx])
+                if idx < len(o3_arr): value_by_param["o3"] = float(o3_arr[idx])
+                if idx < len(no2_arr): value_by_param["no2"] = float(no2_arr[idx])
+                # do not set http_status here; we only report 404 if completely empty
 
     except httpx.HTTPError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Air quality request failed: {str(e)}")
